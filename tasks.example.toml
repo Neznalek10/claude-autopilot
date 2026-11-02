@@ -1,0 +1,96 @@
+# Claude Autopilot: example tasks.
+#
+# `autopilot init` copies this file to tasks.toml. Edit tasks.toml, not this
+# file. Changes apply within 30 seconds while the service runs; if an edit is
+# invalid, the previous tasks stay active and you get one warning on Telegram.
+# Check a file at any time with `autopilot validate`.
+#
+# Structure:
+#   [defaults]  values shared by every task (and, for option keys, by [ask])
+#   [ask]       options for chat messages and `autopilot ask`
+#   [[task]]    one table per task
+#
+# Option keys (allowed in [defaults], [ask] and every [[task]]):
+#   workdir              folder Claude runs in; "~" and relative paths work
+#                        (relative to the folder holding this file).
+#                        Default: the folder holding this file.
+#   model                alias or id, e.g. "sonnet", "opus". Default: Claude's own default.
+#   effort               "low", "medium", "high", "xhigh" or "max". Default: Claude's own default.
+#   allowed_tools        tools Claude may use without asking, e.g. ["Read", "Bash(git log *)"].
+#                        Default: ["Read", "Glob", "Grep", "WebSearch", "WebFetch"].
+#   disallowed_tools     tools Claude may never use. Default: none.
+#   permission_mode      "acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk" or "plan".
+#                        Default: "dontAsk" (anything not in allowed_tools is blocked).
+#   add_dirs             extra folders Claude may access, e.g. ["~/notes"]. Default: none.
+#   append_system_prompt extra instructions added to Claude's system prompt. Default: none.
+#   max_budget_usd       stop a run that would cost more than this many dollars. Default: no cap.
+#   timeout_minutes      kill a run after this many minutes (1-720).
+#                        Default: 30 for tasks, 15 for [ask].
+#
+# Behaviour keys (allowed in [defaults] and every [[task]]):
+#   enabled              true or false. A disabled task never runs on schedule,
+#                        but `autopilot run <task>` and /run still work. Default: true.
+#   notify               "always", "errors" or "never": when the result goes to Telegram.
+#                        Default: "always".
+#
+# Task-only keys:
+#   name                 required. Lower case letters, digits, "-" and "_", up to 40
+#                        characters. Unique. "ask" is reserved.
+#   prompt               required. What Claude is asked to do.
+#   schedule             one expression or a list; leave out for a manual-only task.
+#   description          one line shown in `autopilot list` and /tasks.
+#
+# Schedule forms:
+#   cron                 "30 7 * * 1-5" (minute hour day-of-month month day-of-week)
+#   aliases              "@hourly", "@daily", "@weekly", "@monthly"
+#   friendly             "every 15m", "every 2h", "hourly", "daily 07:30",
+#                        "weekdays 08:00", "weekends 10:00", "mon,wed,fri 18:00",
+#                        "mon-fri 07:00"
+# Times use the time zone from AUTOPILOT_TIMEZONE (default: the system zone).
+# Preview any expression with: autopilot next "weekdays 08:00"
+
+[defaults]
+workdir = "~"
+notify = "always"
+
+[ask]
+# Chat messages from Telegram. Read-only research tools, shorter timeout.
+allowed_tools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+timeout_minutes = 15
+
+[[task]]
+name = "ai-news"
+description = "Morning digest of AI news"
+schedule = "daily 07:30"
+model = "sonnet"
+allowed_tools = ["WebSearch", "WebFetch"]
+timeout_minutes = 15
+prompt = """
+Search the web for the most important AI news from the last 24 hours.
+Reply with a short bullet digest: at most 7 bullets, one sentence each,
+and a link to the source after every bullet. No introduction.
+"""
+
+[[task]]
+name = "day-plan"
+description = "Plan the day from calendar and tasks"
+schedule = "weekdays 06:45"
+allowed_tools = ["Bash(gws calendar *)", "Bash(gws tasks *)"]
+prompt = """
+Look at today's calendar events and open tasks using the gws command line tool.
+Write a plan for the day: fixed appointments first with their times, then the
+open tasks ordered by urgency, then one suggestion for what to start with.
+Keep it under 15 lines.
+"""
+
+[[task]]
+name = "weekly-review"
+description = "Review of the past week (run it by hand)"
+schedule = "sun 19:00"
+enabled = false
+notify = "always"
+prompt = """
+Look at the files in the working folder that changed during the last 7 days.
+Summarise what moved forward, what looks stuck, and suggest three priorities
+for the coming week. Use short bullet points.
+"""
