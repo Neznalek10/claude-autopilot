@@ -1,0 +1,7 @@
+.env
+tasks.toml
+data/
+venv/
+__pycache__/
+*.log
+.DS_Store
