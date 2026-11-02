@@ -1,3 +1,5 @@
+# Files that must stay out of git: secrets, user configuration, local data and build output.
+# .env holds the Telegram bot token; tasks.toml and data/ are personal to this machine.
 .env
 tasks.toml
 data/
@@ -5,3 +7,5 @@ venv/
 __pycache__/
 *.log
 .DS_Store
+*.egg-info/
+build/

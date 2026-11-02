@@ -1,0 +1,27 @@
+# Package metadata for Claude Autopilot.
+# Installed in editable mode into venv/ with `venv/bin/pip install -e .`.
+# The version is read from autopilot/__init__.py so it is defined in one place.
+# The console script `autopilot` points at autopilot.cli:main, which returns the exit code.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-autopilot"
+dynamic = ["version"]
+description = "Runs Claude Code prompt tasks on schedules and reports the results to Telegram."
+readme = "README.md"
+requires-python = ">=3.11"
+# Pinned to match requirements.txt so a fresh install gets the same python-dotenv.
+dependencies = ["python-dotenv==1.2.4"]
+
+[project.scripts]
+autopilot = "autopilot.cli:main"
+
+[tool.setuptools]
+# Ship only the runtime package; tests stay in the repository.
+packages = ["autopilot"]
+
+[tool.setuptools.dynamic]
+version = { attr = "autopilot.__version__" }
