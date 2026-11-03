@@ -65,7 +65,7 @@ from autopilot.runner import ClaudeRunner
 from autopilot.schedule import parse_schedule
 from autopilot.service import UNIT_NAME, install_service, uninstall_service
 from autopilot.settings import Settings, load_settings
-from autopilot.store import Store
+from autopilot.store import INTERRUPTED_MESSAGE, Store
 from autopilot.system import run_command
 from autopilot.tasks import PROTECTED_READ_RULES, load_task_config
 from autopilot.telegram_api import TelegramClient
@@ -83,6 +83,7 @@ from helpers import (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TOKEN = "123456789:" + "B" * 35
 CHAT_ID = 4711
+SETUP_CODE = "482913"
 FOREIGN_CHAT_ID = 999
 START = datetime(2026, 11, 2, 7, 0, tzinfo=TZ)
 WAIT_SECONDS = 10.0
@@ -511,6 +512,7 @@ class AC3RunTests(IntegrationCase):
         for rule in PROTECTED_READ_RULES:
             self.assertIn(rule, denied)
         self.assertIn(f"Read(/{self.home / '.env'})", denied)
+        self.assertIn(f"Read(/{self.home / 'data' / 'autopilot.db'})", denied)
         workspace = self.home / "workspace"
         self.assertEqual(call["cwd"], str(workspace))
         self.assertEqual(stat.S_IMODE(workspace.stat().st_mode), 0o700)
@@ -591,6 +593,21 @@ class AC4SerializationTests(IntegrationCase):
         self.assertTrue((record.error or "").startswith("Timed out"))
         self.assertIn("timed out", self.texts()[0])
         self.wait_until(lambda: self.process_is_gone(int(pid_file.read_text())), "the spawned child to die")
+
+    def test_stopping_during_a_run_records_an_interrupted_error_silently(self) -> None:
+        """Engine.stop() ends a running Claude call; the run is an interrupted error and nothing is sent."""
+        app = self.build('[[task]]\nname = "slow"\nprompt = "FAKE_SLEEP 30"\n', workers=True)
+        run_id = app.engine.enqueue_task("slow", TRIGGER_MANUAL)
+        assert run_id is not None
+        self.wait_until(lambda: len(app.engine.snapshot().running) == 1, "the run to start")
+        self.wait_until(lambda: len(self.claude_calls()) == 1, "Claude to be called")
+        app.engine.stop()
+
+        record = app.store.get_run(run_id)
+        assert record is not None
+        self.assertEqual(record.status, STATUS_ERROR)
+        self.assertEqual(record.error, INTERRUPTED_MESSAGE)
+        self.assertEqual(self.client.sent, [])
 
     @staticmethod
     def process_is_gone(pid: int) -> bool:
@@ -1061,8 +1078,9 @@ class AC12TelegramSetupTests(IntegrationCase):
             # Drained first: a message sent before the setup started must not pick the chat.
             [{"update_id": 3, "message": {"chat": {"id": 111, "type": "private"}, "text": "old"}}],
             [
-                {"update_id": 6, "message": {"chat": {"id": -100, "type": "group"}, "text": "group"}},
+                {"update_id": 6, "message": {"chat": {"id": -100, "type": "group"}, "text": SETUP_CODE}},
                 {"update_id": 7, "message": {"chat": private, "from": {"id": 555}, "text": "hi"}},
+                {"update_id": 8, "message": {"chat": private, "from": {"id": 555}, "text": f" {SETUP_CODE} "}},
             ],
         ]
         out = io.StringIO()
@@ -1073,6 +1091,7 @@ class AC12TelegramSetupTests(IntegrationCase):
             client_factory=lambda _token: self.client,
             wait_seconds=5,
             confirm=lambda _prompt: "y",
+            code_factory=lambda: SETUP_CODE,
         )
 
         self.assertEqual(chat_id, 555)
@@ -1084,7 +1103,7 @@ class AC12TelegramSetupTests(IntegrationCase):
         self.assertNotIn(TOKEN, out.getvalue())
         self.assertIn("Autopilot is connected", self.texts()[-1])
         # The setup message is skipped by the service, so the bot does not answer it again.
-        self.assertEqual(Store(settings.db_path).get_value(OFFSET_KEY), "8")
+        self.assertEqual(Store(settings.db_path).get_value(OFFSET_KEY), "9")
 
 
 class AC13ServiceTests(IntegrationCase):
