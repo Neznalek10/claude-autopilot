@@ -79,6 +79,11 @@ class _UnusedRunner:
     def run(self, prompt: str, options: RunOptions, resume_session: str | None = None) -> RunOutcome:
         """Always fails: reaching this is a programming error.
 
+        Args:
+            prompt: Ignored.
+            options: Ignored.
+            resume_session: Ignored.
+
         Raises:
             RuntimeError: Always.
         """

@@ -70,7 +70,11 @@ class EngineAPI(Protocol):
 
     @property
     def config(self) -> TaskConfig:
-        """The currently loaded tasks."""
+        """The currently loaded tasks.
+
+        Returns:
+            The TaskConfig parsed from tasks.toml.
+        """
         ...
 
     def enqueue_task(
@@ -128,11 +132,20 @@ class EngineAPI(Protocol):
         ...
 
     def next_fire_times(self) -> dict[str, datetime | None]:
-        """Next scheduled run per task name."""
+        """Next scheduled run per task name.
+
+        Returns:
+            Task name mapped to its next fire time, or None for manual-only,
+            disabled or paused tasks.
+        """
         ...
 
     def snapshot(self) -> QueueSnapshot:
-        """Running and queued runs plus the usage-limit gate."""
+        """Running and queued runs plus the usage-limit gate.
+
+        Returns:
+            A QueueSnapshot taken from the store at call time.
+        """
         ...
 
 
