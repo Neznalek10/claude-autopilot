@@ -233,7 +233,7 @@ class TelegramTests(DoctorTestCase):
 
     def test_valid_setup_is_ok_without_the_token(self) -> None:
         """A working bot is ok, shows its username and never the token."""
-        settings = self.make_settings(TELEGRAM_BOT_TOKEN=TOKEN, TELEGRAM_CHAT_ID="-100")
+        settings = self.make_settings(TELEGRAM_BOT_TOKEN=TOKEN, TELEGRAM_CHAT_ID="100")
         seen: list[str] = []
 
         def factory(token: str) -> FakeTelegramClient:

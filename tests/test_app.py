@@ -13,6 +13,7 @@ import contextlib
 import io
 import logging
 import os
+import re
 import signal
 import stat
 import sys
@@ -45,6 +46,7 @@ from autopilot.telegram_api import TelegramClient
 from helpers import FAKE_CLAUDE, TZ, FakeClock, FakeTelegramClient
 
 TOKEN = "123456789:" + "B" * 35
+SETUP_CODE = "493021"
 VALID_TASKS = '[[task]]\nname = "news"\nprompt = "Say hi"\nschedule = "daily 07:30"\n'
 WAIT_SECONDS = 10.0
 
@@ -187,15 +189,16 @@ class BuildAppTests(AppTestCase):
         app = build_app(settings)
         self.assertIn(rule, app.engine.config.tasks["news"].options.disallowed_tools)
         self.assertIn(rule, app.engine.config.ask_options.disallowed_tools)
+        self.assertIn(f"Read(/{settings.db_path})", app.engine.config.ask_options.disallowed_tools)
 
     def test_with_telegram_builds_notifier_and_bot(self) -> None:
         """Telegram settings: a notifier with the local zone, plus the bot."""
-        settings = self.make_settings(TELEGRAM_BOT_TOKEN=TOKEN, TELEGRAM_CHAT_ID="-77")
+        settings = self.make_settings(TELEGRAM_BOT_TOKEN=TOKEN, TELEGRAM_CHAT_ID="77")
         self.write_tasks(settings)
         fake = FakeTelegramClient()
         app = build_app(settings, client=fake)  # type: ignore[arg-type]
         self.assertIsInstance(app.notifier, TelegramNotifier)
-        self.assertEqual(app.notifier.chat_id, -77)
+        self.assertEqual(app.notifier.chat_id, 77)
         self.assertEqual(app.notifier.local_tz, settings.timezone)
         self.assertIs(app.client, fake)
         self.assertIsNotNone(app.bot)
@@ -351,7 +354,7 @@ class TelegramSetupTests(AppTestCase):
     """telegram_setup."""
 
     def message_update(
-        self, update_id: int, chat_id: int, chat_type: str = "private", first_name: str = "Alex"
+        self, update_id: int, chat_id: int, chat_type: str = "private", first_name: str = "Alex", text: str = SETUP_CODE
     ) -> dict:
         """Build a message update from a user whose private chat id equals the user id."""
         return {
@@ -359,7 +362,7 @@ class TelegramSetupTests(AppTestCase):
             "message": {
                 "chat": {"id": chat_id, "type": chat_type},
                 "from": {"id": chat_id, "first_name": first_name, "username": "alex_example"},
-                "text": "hello",
+                "text": text,
             },
         }
 
@@ -375,6 +378,7 @@ class TelegramSetupTests(AppTestCase):
             "wait_seconds": 120,
             "monotonic": TickingClock(1.0),
             "confirm": lambda prompt: "y",
+            "code_factory": lambda: SETUP_CODE,
         }
         defaults.update(kwargs)
         chat_id = telegram_setup(settings, **defaults)  # type: ignore[arg-type]
@@ -396,6 +400,7 @@ class TelegramSetupTests(AppTestCase):
         self.assertIn("connected", fake.sent[0]["text"])
         self.assertIn("https://t.me/autopilot_test_bot", output)
         self.assertIn("Alex (@alex_example), chat id 555", output)
+        self.assertIn(f"send the code {SETUP_CODE}", output)
         self.assertNotIn(TOKEN, output)
 
     def test_stale_pending_update_is_skipped(self) -> None:
@@ -409,6 +414,69 @@ class TelegramSetupTests(AppTestCase):
         self.assertEqual(len(asked), 1)
         self.assertNotIn("Stranger", output)
         self.assertEqual(Store(settings.db_path).get_value(OFFSET_KEY), "5")
+
+    def test_message_without_the_code_is_skipped_and_name_sanitized(self) -> None:
+        """A stranger's message is never offered; its name is printed without escape codes."""
+        settings = self.make_settings()
+        fake = FakeTelegramClient()
+        evil = self.message_update(5, 900, first_name="\x1b[2JEvil\x07", text="hi")
+        fake.updates = [[], [evil], [self.message_update(6, 42, text=f" {SETUP_CODE} \n")]]
+        asked: list[str] = []
+        chat_id, output = self.run_setup(settings, fake, confirm=lambda prompt: asked.append(prompt) or "y")
+        self.assertEqual(chat_id, 42)
+        self.assertEqual(len(asked), 1)
+        self.assertIn("without the code from [2JEvil (@alex_example)", output)
+        self.assertNotIn("\x1b", output)
+        self.assertNotIn("\x07", output)
+
+    def test_default_code_is_six_random_digits(self) -> None:
+        """Without code_factory the printed code is six digits and is what the bot waits for."""
+        settings = self.make_settings()
+        fake = FakeTelegramClient()
+        out = io.StringIO()
+        match_holder: list[str] = []
+
+        def confirm(prompt: str) -> str:
+            """Record the code shown to the user, then agree."""
+            match_holder.extend(re.findall(r"send the code (\d{6}) ", out.getvalue()))
+            return "y"
+
+        fake.updates = [[], []]
+        original = fake.get_updates
+        calls = {"n": 0}
+
+        def get_updates(offset: int | None = None, timeout: int = 50) -> list[dict]:
+            """Return the code message once the code has been printed."""
+            calls["n"] += 1
+            shown = re.findall(r"send the code (\d{6}) ", out.getvalue())
+            if shown and calls["n"] > 1:
+                return [self.message_update(9, 77, text=shown[0])]
+            return original(offset, timeout)
+
+        fake.get_updates = get_updates  # type: ignore[method-assign]
+        chat_id = telegram_setup(
+            settings,
+            secret_input=lambda prompt: TOKEN,
+            out=out,
+            client_factory=lambda token: fake,
+            monotonic=TickingClock(1.0),
+            confirm=confirm,
+        )
+        self.assertEqual(chat_id, 77)
+        self.assertEqual(len(match_holder), 1)
+
+    def test_no_terminal_gives_a_friendly_error(self) -> None:
+        """EOF on the confirmation prompt becomes an AutopilotError, not a traceback."""
+        fake = FakeTelegramClient()
+        fake.updates = [[], [self.message_update(7, 555)]]
+
+        def no_terminal(prompt: str) -> str:
+            """Behave like input() with stdin closed."""
+            raise EOFError
+
+        with self.assertRaises(AutopilotError) as caught:
+            self.run_setup(self.make_settings(), fake, confirm=no_terminal)
+        self.assertIn("interactive terminal", str(caught.exception))
 
     def test_group_chat_is_refused_with_a_note(self) -> None:
         """A group message is never offered; a note is printed and waiting continues."""
@@ -452,6 +520,7 @@ class TelegramSetupTests(AppTestCase):
                 client_factory=lambda token: fake,
                 monotonic=TickingClock(1.0),
                 confirm=lambda prompt: "y",
+                code_factory=lambda: SETUP_CODE,
             )
         self.assertIn("https://t.me/", captured.getvalue())
 

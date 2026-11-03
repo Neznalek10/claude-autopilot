@@ -22,6 +22,7 @@ import getpass
 import logging
 import logging.handlers
 import os
+import secrets
 import shutil
 import signal
 import sys
@@ -68,6 +69,8 @@ HTTP_CONFLICT = 409
 PRIVATE_CHAT_TYPE = "private"
 CONFIRM_PROMPT = "Use this chat? [y/N] "
 CONFIRM_YES = ("y", "yes")
+CODE_DIGITS = 6
+NO_TERMINAL_MESSAGE = "telegram-setup needs an interactive terminal to confirm the chat."
 DATA_DIR_MODE = 0o700
 LOG_FILE_MODE = 0o600
 PUBLIC_FILE_MODE = 0o644
@@ -252,9 +255,9 @@ def build_app(
         store=store,
         runner=runner,
         notifier=notifier,
-        # The .env file holds the bot token: Claude must never be allowed to read it.
+        # .env holds the bot token and the database holds the chat history: Claude must not read either.
         config_loader=lambda: load_task_config(
-            settings.tasks_file, protected_paths=(settings.env_file,)
+            settings.tasks_file, protected_paths=(settings.env_file, settings.db_path)
         ),
         clock=now,
         tasks_file=settings.tasks_file,
@@ -322,6 +325,9 @@ def telegram_setup(
     wait_seconds: int = DEFAULT_SETUP_WAIT_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
     confirm: Callable[[str], str] = input,
+    code_factory: Callable[[], str] = lambda: "".join(
+        secrets.choice("0123456789") for _ in range(CODE_DIGITS)
+    ),
 ) -> int:
     """Connect the bot: validate the token, learn the chat id, save both, send a test message.
 
@@ -336,6 +342,7 @@ def telegram_setup(
         wait_seconds: How long to wait for a confirmed chat.
         monotonic: Clock used for the wait deadline.
         confirm: Asks the yes/no question and returns the answer.
+        code_factory: Returns the one-time code the user must send to the bot.
 
     Returns:
         The chat id that was saved.
@@ -353,12 +360,16 @@ def telegram_setup(
 
     # Old messages (possibly from strangers) must not be mistaken for the user's first one.
     offset = _drain_pending_updates(client)
+    code = code_factory()
     out.write(
-        f"Open https://t.me/{username} and send any message (waiting up to {wait_seconds} s)...\n"
+        f"Open https://t.me/{username} and send the code {code} "
+        f"(waiting up to {wait_seconds} s)...\n"
     )
     out.flush()
 
-    update_id, chat_id = _wait_for_confirmed_chat(client, offset, wait_seconds, monotonic, confirm, out)
+    update_id, chat_id = _wait_for_confirmed_chat(
+        client, offset, wait_seconds, monotonic, confirm, out, code
+    )
     set_env_value(settings.env_file, "TELEGRAM_CHAT_ID", str(chat_id))
     # Skip this message in the service so the bot does not answer it a second time.
     Store(settings.db_path).set_value(OFFSET_KEY, str(update_id + 1))
@@ -395,14 +406,31 @@ def _drain_pending_updates(client: TelegramClient) -> int | None:
             return offset
 
 
+def _printable(value: object) -> str:
+    """Return ``value`` as text without control or escape characters, so it is safe to print."""
+    return "".join(ch for ch in str(value or "") if ch.isprintable()).strip()
+
+
 def _describe_sender(message: dict) -> str:
     """Return "<first name> (@username), chat id <id>" for a private message (parts may be absent)."""
     sender = message.get("from") or message.get("chat") or {}
-    parts = [str(sender.get("first_name") or "").strip()]
+    parts = [_printable(sender.get("first_name"))]
     if sender.get("username"):
-        parts.append(f"(@{sender['username']})")
+        parts.append(f"(@{_printable(sender['username'])})")
     label = " ".join(part for part in parts if part)
     return f"{label}, chat id {message['chat']['id']}" if label else f"chat id {message['chat']['id']}"
+
+
+def _ask_yes(confirm: Callable[[str], str]) -> bool:
+    """Ask the confirmation question; True only for "y" or "yes".
+
+    Raises:
+        AutopilotError: When there is no terminal to answer on (EOF).
+    """
+    try:
+        return confirm(CONFIRM_PROMPT).strip().lower() in CONFIRM_YES
+    except EOFError:
+        raise AutopilotError(NO_TERMINAL_MESSAGE) from None
 
 
 def _wait_for_confirmed_chat(
@@ -412,6 +440,7 @@ def _wait_for_confirmed_chat(
     monotonic: Callable[[], float],
     confirm: Callable[[str], str],
     out: TextIO,
+    code: str,
 ) -> tuple[int, int]:
     """Poll new messages until the user confirms a private chat.
 
@@ -422,6 +451,7 @@ def _wait_for_confirmed_chat(
         monotonic: Clock for the deadline.
         confirm: Asks the yes/no question.
         out: Where notes are written.
+        code: One-time code a private message must contain to be considered.
 
     Returns:
         ``(update_id, chat_id)`` of the confirmed message.
@@ -447,8 +477,12 @@ def _wait_for_confirmed_chat(
             if chat.get("type") != PRIVATE_CHAT_TYPE:
                 out.write("Ignored a message from a group or channel: send it in a private chat with the bot.\n")
                 continue
+            if str(message.get("text") or "").strip() != code:
+                # Anyone can message a public bot; only the code holder is offered for confirmation.
+                out.write(f"Ignored a message without the code from {_describe_sender(message)}\n")
+                continue
             out.write(f"Message from {_describe_sender(message)}\n")
-            if confirm(CONFIRM_PROMPT).strip().lower() in CONFIRM_YES:
+            if _ask_yes(confirm):
                 return update["update_id"], chat["id"]
             out.write("Not saved. Waiting for another message...\n")
 
