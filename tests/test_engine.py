@@ -57,7 +57,7 @@ from autopilot.models import (
     TaskConfig,
 )
 from autopilot.schedule import parse_schedule
-from autopilot.store import Store
+from autopilot.store import INTERRUPTED_MESSAGE, Store
 from helpers import TZ, FakeClock, make_config, make_options, make_task
 
 START = datetime(2026, 11, 2, 7, 30, tzinfo=TZ)  # Monday 07:30
@@ -1013,6 +1013,35 @@ class ChatTests(EngineTestCase):
         self.run_now(turn_a)
         self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "new")
 
+    def test_turn_queued_at_the_same_instant_as_new_stores_its_session(self) -> None:
+        """With a frozen clock, /new followed by a message in the same instant starts the new conversation."""
+        self.runner.queue(success(session_id="s1"))
+        self.engine.reset_chat()
+        self.chat()
+        self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "s1")
+
+    def test_retried_turn_from_before_new_stays_cut_off(self) -> None:
+        """A pre-/new turn that hit the usage limit is retried as a copy; it must not revive the old chat."""
+        turn_a = self.engine.enqueue_prompt("A", dispatch=False)
+        self.clock.advance(seconds=1)
+        self.engine.reset_chat()
+        self.clock.advance(seconds=1)
+        turn_b = self.engine.enqueue_prompt("B", dispatch=False)
+        self.runner.queue(
+            success(session_id="new"),
+            RunOutcome(status=STATUS_RATE_LIMITED, error="limit", retry_at=self.clock() + timedelta(minutes=10)),
+            success(session_id="old"),
+        )
+        self.run_now(turn_b)
+        self.assertEqual(self.run_now(turn_a).status, STATUS_RATE_LIMITED)
+        self.clock.advance(minutes=11)
+        (retry_id,) = self.engine.tick()
+        retry = self.store.get_run(retry_id)
+        # The copy is queued after the reset; only its chain root predates it.
+        self.assertGreater(retry.queued_at, START + timedelta(seconds=2))
+        self.assertEqual(self.run_now(retry_id).status, STATUS_SUCCESS)
+        self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "new")
+
     def test_turn_queued_after_new_stores_its_session(self) -> None:
         """Only turns queued at or before the reset are affected; later ones store normally."""
         self.engine.reset_chat()
@@ -1126,6 +1155,52 @@ class ChatTests(EngineTestCase):
             thread.join(WAIT_SECONDS)
         self.assertEqual([c.prompt for c in self.runner.calls], ["one", "two"])
         self.assertEqual([c.resume_session for c in self.runner.calls], [None, "s1"])
+
+
+class StoppingTests(EngineTestCase):
+    """Runs whose Claude call ends because the service is stopping."""
+
+    def stop_during_the_call(self) -> None:
+        """Make the fake runner call engine.stop() while "Claude" is working."""
+        self.runner.on_run = self.engine.stop
+
+    def test_run_finished_by_stop_is_interrupted_and_silent(self) -> None:
+        """A killed call is recorded as interrupted, whatever it returned, and nobody is notified."""
+        self.stop_during_the_call()
+        self.runner.queue(RunOutcome(status=STATUS_ERROR, error="Claude CLI exited with code -15"))
+        record = self.run_news()
+        self.assertEqual((record.status, record.error), (STATUS_ERROR, INTERRUPTED_MESSAGE))
+        self.assertEqual((self.notifier.runs, self.notifier.texts), ([], []))
+        self.assertEqual(self.store.get_run(record.id).error, INTERRUPTED_MESSAGE)
+
+    def test_interrupted_resumed_chat_turn_keeps_the_conversation(self) -> None:
+        """A resumed turn killed by stop() must not wipe the session like a real failed turn does."""
+        self.runner.queue(success(session_id="s1"))
+        self.chat()
+        self.notifier.runs.clear()
+        self.stop_during_the_call()
+        self.runner.queue(RunOutcome(status=STATUS_ERROR, error="exited with code -15"))
+        record = self.chat()
+        self.assertEqual(record.error, INTERRUPTED_MESSAGE)
+        self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "s1")
+        self.assertEqual(self.notifier.runs, [])
+
+    def test_successful_chat_turn_returning_while_stopping_does_not_store_a_session(self) -> None:
+        """Nothing about a stopping service's last call touches the chat session."""
+        self.stop_during_the_call()
+        self.runner.queue(success(session_id="late"))
+        self.chat()
+        self.assertIsNone(self.store.get_value(CHAT_SESSION_KEY))
+
+    def test_rate_limit_returning_while_stopping_does_not_close_the_gate(self) -> None:
+        """A limit reported by a killed call neither notifies nor holds later runs."""
+        self.stop_during_the_call()
+        self.runner.queue(RunOutcome(status=STATUS_RATE_LIMITED, error="limit", retry_at=START + timedelta(hours=1)))
+        record = self.run_news()
+        self.assertEqual(record.error, INTERRUPTED_MESSAGE)
+        self.assertIsNone(record.retry_at)
+        self.assertIsNone(self.store.get_value(LIMITED_UNTIL_KEY))
+        self.assertEqual(self.notifier.texts, [])
 
 
 class InformationTests(EngineTestCase):

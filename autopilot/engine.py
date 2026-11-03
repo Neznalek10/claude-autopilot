@@ -58,7 +58,7 @@ from autopilot.models import (
     TaskConfig,
 )
 from autopilot.scheduler import evaluate, next_fire_time, to_utc
-from autopilot.store import Store
+from autopilot.store import INTERRUPTED_MESSAGE, Store
 
 logger = logging.getLogger(__name__)
 
@@ -395,11 +395,15 @@ class Engine:
     def _was_chat_reset_since(self, queued_at: datetime) -> bool:
         """Tell whether the user reset the conversation after a chat turn was queued.
 
+        The comparison is strict, so a turn queued at the very instant of the
+        reset (a frozen test clock, or two events in one microsecond) counts as
+        belonging to the new conversation.
+
         Args:
             queued_at: When the turn was queued.
 
         Returns:
-            True when a reset happened at or after ``queued_at``.
+            True when a reset happened after ``queued_at``.
         """
         raw = self._store.get_value(CHAT_RESET_KEY)
         if raw is None:
@@ -410,7 +414,7 @@ class Engine:
             return False
         if reset_at.utcoffset() is None:
             return False
-        return to_utc(queued_at) <= to_utc(reset_at)
+        return to_utc(queued_at) < to_utc(reset_at)
 
     # ------------------------------------------------------------------- tick
 
@@ -644,6 +648,8 @@ class Engine:
         self._store.mark_running(record.id, now)
         outcome = self._call_runner(record, options, resume_session)
         finished_at = self._clock()
+        if self._stopping.is_set():
+            return self._finish_interrupted(record, finished_at)
         if is_chat:
             outcome = self._apply_chat_outcome(
                 record, outcome, resumed=resume_session is not None, now=finished_at
@@ -653,6 +659,25 @@ class Engine:
         finished = self._store_outcome(record.id, outcome, finished_at)
         self._notify_run(finished)
         return finished
+
+    def _finish_interrupted(self, record: RunRecord, now: datetime) -> RunRecord:
+        """Record a run whose Claude call ended because the service is stopping.
+
+        Whatever the call returned is the product of stop() killing the process
+        (for example "exited with code -15"), so it is neither reported to the
+        user nor allowed to change the chat session.
+
+        Args:
+            record: The run being executed.
+            now: The current moment.
+
+        Returns:
+            The finished record, with status error and the interrupted message.
+        """
+        logger.info("Run #%d was interrupted by the service stopping", record.id)
+        return self._store.finish_run(
+            record.id, status=STATUS_ERROR, finished_at=now, error=INTERRUPTED_MESSAGE
+        )
 
     def _call_runner(
         self, record: RunRecord, options: RunOptions, resume_session: str | None
@@ -727,6 +752,31 @@ class Engine:
             return None
         return session
 
+    def _first_queued_at(self, record: RunRecord) -> datetime:
+        """Find when the first run of a retry chain was queued.
+
+        A retry is a copy with a fresh ``queued_at``; the conversation it
+        belongs to is the one that was current when the original was queued.
+
+        Args:
+            record: A run, possibly a retry.
+
+        Returns:
+            ``queued_at`` of the root of the ``retry_of`` chain (the record's own if it has none).
+        """
+        queued_at = record.queued_at
+        seen = {record.id}
+        parent_id = record.retry_of
+        # ``seen`` guards against a corrupt cycle in the chain.
+        while parent_id is not None and parent_id not in seen:
+            seen.add(parent_id)
+            parent = self._store.get_run(parent_id)
+            if parent is None:
+                break
+            queued_at = parent.queued_at
+            parent_id = parent.retry_of
+        return queued_at
+
     def _apply_chat_outcome(
         self, record: RunRecord, outcome: RunOutcome, *, resumed: bool, now: datetime
     ) -> RunOutcome:
@@ -747,7 +797,7 @@ class Engine:
             conversation was reset.
         """
         if outcome.status == STATUS_SUCCESS and outcome.session_id:
-            if not self._was_chat_reset_since(record.queued_at):
+            if not self._was_chat_reset_since(self._first_queued_at(record)):
                 self._store.set_value(CHAT_SESSION_KEY, outcome.session_id)
                 self._store.set_value(CHAT_UPDATED_KEY, now.isoformat())
         elif outcome.status == STATUS_ERROR and resumed:
@@ -897,6 +947,8 @@ class Engine:
         """Ask the workers to exit, end in-flight Claude processes and wait briefly.
 
         Queued runs stay in the store; the next start marks them as interrupted.
+        Runs whose Claude call returns after this point are recorded as
+        interrupted, without a notification.
         A runner that offers ``terminate_all`` (ClaudeRunner does) is asked to
         kill the Claude processes still running, so none outlives the service.
         """
