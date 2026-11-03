@@ -39,6 +39,7 @@ from autopilot.formatting import (
 )
 from autopilot.models import (
     ASK_TASK_NAME,
+    BOT_COMMANDS,
     TRIGGER_CHAT,
     TRIGGER_TELEGRAM,
     QueueSnapshot,
@@ -50,17 +51,6 @@ from autopilot.telegram_api import TelegramClient, is_parse_error
 
 logger = logging.getLogger(__name__)
 
-BOT_COMMANDS = (
-    ("tasks", "List tasks and next runs"),
-    ("run", "Run a task now: /run <task>"),
-    ("ask", "Chat with Claude: /ask <text> (or just type)"),
-    ("new", "Start a new conversation: /new [text]"),
-    ("last", "Latest result: /last [task]"),
-    ("status", "What is running and queued"),
-    ("pause", "Pause a task's schedule"),
-    ("resume", "Resume a task's schedule"),
-    ("help", "How to use this bot"),
-)
 OFFSET_KEY = "telegram_offset"
 POLL_BACKOFF_START = 5
 POLL_BACKOFF_MAX = 60
@@ -253,16 +243,24 @@ class TelegramBot:
             return
         text = message.get("text")
         chat_id = (message.get("chat") or {}).get("id")
+        sender_id = (message.get("from") or {}).get("id")
         if not isinstance(text, str) or not text.strip():
             return
-        if chat_id != self.chat_id:
-            logger.warning("Ignoring a message from unauthorized chat %s", chat_id)
+        # Only the owner's private chat may command the runner: in a private chat
+        # chat.id equals the user id, so a group (or another sender inside the
+        # configured chat id) fails one of the two checks.
+        if chat_id != self.chat_id or sender_id != self.chat_id:
+            logger.warning(
+                "Ignoring a message from unauthorized chat %s (sender %s)", chat_id, sender_id
+            )
             return
         text = text.strip()
         if not text.startswith(COMMAND_PREFIX):
             self._chat(text)
             return
-        command, _, argument = text.partition(" ")
+        parts = text.split(None, 1)
+        command = parts[0]
+        argument = parts[1] if len(parts) > 1 else ""
         # "/Run@MyBot" -> "run": group chats append the bot name to commands.
         name = command[1:].split(BOT_NAME_SEPARATOR, 1)[0].lower()
         handler = self._handlers.get(name)
@@ -304,7 +302,8 @@ class TelegramBot:
         """Handle one update without letting any error escape, then store its offset."""
         try:
             self.handle_update(update)
-        except Exception:  # noqa: BLE001 - one bad update must never stop the bot
+        # Broad on purpose: one bad update must never stop the polling loop.
+        except Exception:
             logger.exception("Failed to handle Telegram update %s", update.get("update_id"))
         # Stored even after a failure: replaying a poison update would loop forever.
         update_id = update.get("update_id")
@@ -332,15 +331,21 @@ class TelegramBot:
         """Return the names of the currently defined tasks, in file order."""
         return list(self.engine.config.tasks)
 
-    def _require_task(self, name: str) -> str:
-        """Return ``name`` if the task exists.
+    def _reply_if_unknown_task(self, name: str) -> bool:
+        """Reply with the TaskNotFoundError message when ``name`` isn't a task.
 
-        Raises:
-            TaskNotFoundError: If tasks.toml defines no such task.
+        Args:
+            name: Task name typed by the user.
+
+        Returns:
+            True when the task is unknown (the reply was sent and the caller
+            should stop), False when it exists.
         """
-        if name not in self.engine.config.tasks:
-            raise TaskNotFoundError(name, self._task_names())
-        return name
+        if name in self.engine.config.tasks:
+            return False
+        error = TaskNotFoundError(name, self._task_names())
+        self._reply(escape_html(str(error)))
+        return True
 
     def _ahead_of(self, run_id: int) -> int:
         """Count active runs created before ``run_id`` (the ones it waits for)."""
@@ -388,10 +393,7 @@ class TelegramBot:
             names = ", ".join(self._task_names()) or "none defined"
             self._reply(f"Usage: /run &lt;task&gt;\nTasks: {escape_html(names)}")
             return
-        try:
-            self._require_task(argument)
-        except TaskNotFoundError as err:
-            self._reply(escape_html(str(err)))
+        if self._reply_if_unknown_task(argument):
             return
         run_id = self.engine.enqueue_task(argument, TRIGGER_TELEGRAM)
         if run_id is None:
@@ -421,10 +423,7 @@ class TelegramBot:
         """/last [task]: resend the newest finished run."""
         task_name = argument or None
         if task_name is not None and task_name != ASK_TASK_NAME:
-            try:
-                self._require_task(task_name)
-            except TaskNotFoundError as err:
-                self._reply(escape_html(str(err)))
+            if self._reply_if_unknown_task(task_name):
                 return
         finished = self.store.list_runs(task_name=task_name, limit=1, finished_only=True)
         if not finished:
@@ -453,10 +452,7 @@ class TelegramBot:
             names = ", ".join(self._task_names()) or "none defined"
             self._reply(f"Usage: /{verb} &lt;task&gt;\nTasks: {escape_html(names)}")
             return
-        try:
-            self._require_task(name)
-        except TaskNotFoundError as err:
-            self._reply(escape_html(str(err)))
+        if self._reply_if_unknown_task(name):
             return
         self.store.set_paused(name, paused)
         icon, word = ("⏸", "Paused") if paused else ("▶️", "Resumed")

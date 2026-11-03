@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 from autopilot.bot import (
-    BOT_COMMANDS,
     OFFSET_KEY,
     POLL_BACKOFF_MAX,
     POLL_BACKOFF_START,
@@ -24,6 +23,7 @@ from autopilot.bot import (
 from autopilot.errors import TaskNotFoundError, TelegramError
 from autopilot.models import (
     ASK_TASK_NAME,
+    BOT_COMMANDS,
     STATUS_ERROR,
     STATUS_SUCCESS,
     TRIGGER_CHAT,
@@ -103,9 +103,15 @@ class FakeEngine:
         return [name for name, _ in self.calls]
 
 
-def message_update(text: str | None, chat_id: int = CHAT_ID, update_id: int = 1) -> dict[str, Any]:
-    """Build a Telegram message update."""
-    message: dict[str, Any] = {"chat": {"id": chat_id}}
+def message_update(
+    text: str | None,
+    chat_id: int = CHAT_ID,
+    update_id: int = 1,
+    sender_id: int | None = None,
+) -> dict[str, Any]:
+    """Build a Telegram message update; the sender defaults to the chat id (a private chat)."""
+    sender = chat_id if sender_id is None else sender_id
+    message: dict[str, Any] = {"chat": {"id": chat_id}, "from": {"id": sender}}
     if text is not None:
         message["text"] = text
     return {"update_id": update_id, "message": message}
@@ -192,6 +198,7 @@ class NotifierTests(BotTestCase):
             """Client whose sends always fail with a 500."""
 
             def send_message(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+                """Always fail with a 500."""
                 raise TelegramError("Telegram sendMessage failed: boom", status=500)
 
         notifier = TelegramNotifier(Failing(), CHAT_ID)
@@ -349,6 +356,7 @@ class ChatTests(BotTestCase):
         """A failing typing indicator never breaks the chat flow."""
 
         def boom(chat_id: int, action: str = "typing") -> None:
+            """Fail like a Telegram outage."""
             raise TelegramError("nope", status=500)
 
         self.client.send_chat_action = boom  # type: ignore[method-assign]
@@ -359,6 +367,15 @@ class ChatTests(BotTestCase):
         """/ask <text> behaves like plain text."""
         self.send("/ask what is up")
         self.assertEqual(self.engine.calls, [("enqueue_prompt", ("what is up", TRIGGER_CHAT))])
+
+    def test_command_argument_split_on_any_whitespace(self) -> None:
+        """A newline or tab between command and argument still separates them."""
+        self.send("/ask\nhello there")
+        self.send("/run\tnews")
+        self.assertEqual(
+            self.engine.calls,
+            [("enqueue_prompt", ("hello there", TRIGGER_CHAT)), ("enqueue_task", ("news", TRIGGER_TELEGRAM))],
+        )
 
     def test_ask_without_text_shows_usage(self) -> None:
         """/ask alone explains usage and queues nothing."""
@@ -388,6 +405,29 @@ class FilteringTests(BotTestCase):
             self.bot.handle_update(message_update("/run news", chat_id=OTHER_CHAT_ID))
         self.assertIn(str(OTHER_CHAT_ID), logs.output[0])
         self.assertEqual(self.client.sent, [])
+        self.assertEqual(self.engine.calls, [])
+
+    def test_group_chat_is_ignored(self) -> None:
+        """A group (negative chat id) never commands the runner, even from the owner."""
+        with self.assertLogs("autopilot.bot", level="WARNING") as logs:
+            self.bot.handle_update(message_update("/run news", chat_id=-100123, sender_id=CHAT_ID))
+        self.assertIn("-100123", logs.output[0])
+        self.assertEqual(self.client.sent, [])
+        self.assertEqual(self.engine.calls, [])
+
+    def test_foreign_sender_in_owner_chat_is_ignored(self) -> None:
+        """A sender other than the owner is ignored even inside the configured chat id."""
+        with self.assertLogs("autopilot.bot", level="WARNING"):
+            self.bot.handle_update(message_update("hello", chat_id=CHAT_ID, sender_id=OTHER_CHAT_ID))
+        self.assertEqual(self.client.sent, [])
+        self.assertEqual(self.engine.calls, [])
+
+    def test_message_without_sender_is_ignored(self) -> None:
+        """A message with no 'from' field cannot be attributed to the owner."""
+        update = message_update("hello")
+        del update["message"]["from"]
+        with self.assertLogs("autopilot.bot", level="WARNING"):
+            self.bot.handle_update(update)
         self.assertEqual(self.engine.calls, [])
 
     def test_updates_without_text_are_ignored(self) -> None:
@@ -426,6 +466,7 @@ class PollingTests(BotTestCase):
         original = self.bot.handle_update
 
         def handle_then_stop(update: dict[str, Any]) -> None:
+            """Handle the update normally, then end the poll loop."""
             original(update)
             stop.set()
 
@@ -440,6 +481,7 @@ class PollingTests(BotTestCase):
         seen: list[str | None] = []
 
         def handle(update: dict[str, Any]) -> None:
+            """Record the stored offset, then fail on update 6 after stopping."""
             seen.append(self.store.get_value(OFFSET_KEY))
             if update["update_id"] == 6:
                 stop.set()
@@ -459,6 +501,7 @@ class PollingTests(BotTestCase):
         offsets: list[int | None] = []
 
         def get_updates(offset: int | None = None, timeout: int = 50) -> list[dict[str, Any]]:
+            """Record the offset, stop the loop and return no updates."""
             offsets.append(offset)
             stop.set()
             return []
@@ -485,6 +528,7 @@ class PollingTests(BotTestCase):
         stop = StopAfterWaits(2)
 
         def get_updates(offset: int | None = None, timeout: int = 50) -> list[dict[str, Any]]:
+            """Raise or return the next scripted outcome."""
             error = errors.pop(0)
             if error is not None:
                 raise error
@@ -499,6 +543,7 @@ class PollingTests(BotTestCase):
         """A failing command registration is logged and polling still runs."""
 
         def boom(commands: Any) -> None:
+            """Fail like a rejected setMyCommands call."""
             raise TelegramError("no", status=500)
 
         self.client.set_my_commands = boom  # type: ignore[method-assign]
@@ -514,6 +559,7 @@ class PollingTests(BotTestCase):
         offsets: list[int | None] = []
 
         def get_updates(offset: int | None = None, timeout: int = 50) -> list[dict[str, Any]]:
+            """Record the offset, stop the loop and return no updates."""
             offsets.append(offset)
             stop.set()
             return []
