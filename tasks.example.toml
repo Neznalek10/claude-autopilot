@@ -5,6 +5,15 @@
 # invalid, the previous tasks stay active and you get one warning on Telegram.
 # Check a file at any time with `autopilot validate`.
 #
+# Safety:
+#   Tasks read web pages, and a page can contain hidden instructions. So by default
+#   every task runs in the empty "workspace" folder, away from your files and from
+#   the .env file that holds your Telegram bot token. On top of that, Claude is
+#   always blocked from reading .env files, ~/.ssh, ~/.aws, ~/.gnupg,
+#   ~/.claude/.credentials.json and ~/.config/gws, whatever you put in
+#   allowed_tools. Only point a task at another workdir when it needs those files,
+#   and then do not give it web tools (WebSearch, WebFetch).
+#
 # Structure:
 #   [defaults]  values shared by every task (and, for option keys, by [ask])
 #   [ask]       options for chat messages and `autopilot ask`
@@ -13,7 +22,8 @@
 # Option keys (allowed in [defaults], [ask] and every [[task]]):
 #   workdir              folder Claude runs in; "~" and relative paths work
 #                        (relative to the folder holding this file).
-#                        Default: the folder holding this file.
+#                        Default: the "workspace" folder next to this file, an empty
+#                        sandbox that autopilot creates for you (see Safety below).
 #   model                alias or id, e.g. "sonnet", "opus". Default: Claude's own default.
 #   effort               "low", "medium", "high", "xhigh" or "max". Default: Claude's own default.
 #   allowed_tools        tools Claude may use without asking, e.g. ["Read", "Bash(git log *)"].
@@ -50,7 +60,6 @@
 # Preview any expression with: autopilot next "weekdays 08:00"
 
 [defaults]
-workdir = "~"
 notify = "always"
 
 [ask]
@@ -89,6 +98,10 @@ description = "Review of the past week (run it by hand)"
 schedule = "sun 19:00"
 enabled = false
 notify = "always"
+# Point this at the folder with your notes or project. It reads local files, so it
+# gets no web tools: a web page must never be able to steer a task that sees your files.
+workdir = "~"
+allowed_tools = ["Read", "Glob", "Grep"]
 prompt = """
 Look at the files in the working folder that changed during the last 7 days.
 Summarise what moved forward, what looks stuck, and suggest three priorities

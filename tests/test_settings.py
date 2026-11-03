@@ -137,6 +137,14 @@ class LoadSettingsTest(unittest.TestCase):
                         self.load({variable: value})
                     self.assertIn(variable, str(ctx.exception))
 
+    def test_unknown_user_home_is_config_error(self) -> None:
+        """'~nosuchuser' in a path variable raises ConfigError naming the variable."""
+        for variable in ("AUTOPILOT_TASKS_FILE", "AUTOPILOT_DATA_DIR", "AUTOPILOT_HOME"):
+            with self.subTest(variable=variable):
+                with self.assertRaises(ConfigError) as ctx:
+                    load_settings({variable: "~nosuchuser_zz/x", "AUTOPILOT_TIMEZONE": "UTC"}, home=None if variable == "AUTOPILOT_HOME" else self.home)
+                self.assertIn(variable, str(ctx.exception))
+
     def test_token_never_in_error(self) -> None:
         """A bad chat id error must not echo the bot token."""
         with self.assertRaises(ConfigError) as ctx:
@@ -242,6 +250,19 @@ class SetEnvValueTest(unittest.TestCase):
         """A typical bot token needs no quoting."""
         set_env_value(self.env_file, "TELEGRAM_BOT_TOKEN", "123456:AA-bb_CC")
         self.assertEqual(self.env_file.read_text(encoding="utf-8"), "TELEGRAM_BOT_TOKEN=123456:AA-bb_CC\n")
+
+    def test_rejects_unicode_line_separators(self) -> None:
+        """U+2028, U+0085 and control codes are rejected so rewrites can't split a value."""
+        for value in ("a\u2028b=1", "a\u0085b", "a\x00b", "a\tb"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    set_env_value(self.env_file, "OK", value)
+
+    def test_existing_unicode_separator_does_not_split_lines(self) -> None:
+        """A comment holding U+2028 stays one line when the file is rewritten."""
+        self.env_file.write_text("# note\u2028X=1\nA=1\n", encoding="utf-8")
+        set_env_value(self.env_file, "B", "2")
+        self.assertEqual(self.env_file.read_text(encoding="utf-8"), "# note\u2028X=1\nA=1\nB=2\n")
 
     def test_rejects_bad_key_and_newline(self) -> None:
         """Invalid keys and multi-line values raise ValueError and write nothing."""

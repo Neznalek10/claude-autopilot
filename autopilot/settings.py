@@ -108,9 +108,17 @@ def _non_empty(values: Mapping[str, str | None]) -> dict[str, str]:
     return {key: value for key, value in values.items() if value is not None and value.strip() != ""}
 
 
-def _resolve_path(raw: str, home: Path) -> Path:
-    """Expand ``~`` and resolve a relative path against ``home``."""
-    path = Path(raw.strip()).expanduser()
+def _resolve_path(raw: str, home: Path, variable: str) -> Path:
+    """Expand ``~`` and resolve a relative path against ``home``.
+
+    Raises:
+        ConfigError: Naming ``variable`` if a ``~user`` prefix can't be expanded.
+    """
+    try:
+        path = Path(raw.strip()).expanduser()
+    except RuntimeError:
+        # expanduser raises RuntimeError for "~user" when that user does not exist.
+        raise ConfigError(f"{variable} uses '{raw}', but that home folder cannot be found.") from None
     if not path.is_absolute():
         path = home / path
     return path.resolve()
@@ -196,7 +204,7 @@ def load_settings(
     real_env = _non_empty(os.environ if env is None else env)
     if home is None:
         raw_home = real_env.get("AUTOPILOT_HOME")
-        home = Path(raw_home).expanduser().resolve() if raw_home else project_root()
+        home = _resolve_path(raw_home, Path.cwd(), "AUTOPILOT_HOME") if raw_home else project_root()
     else:
         home = home.expanduser().resolve()
 
@@ -207,8 +215,8 @@ def load_settings(
         for key, value in _non_empty(dotenv_values(env_file)).items():
             merged.setdefault(key, value)
 
-    tasks_file = _resolve_path(merged.get("AUTOPILOT_TASKS_FILE", DEFAULT_TASKS_FILE_NAME), home)
-    data_dir = _resolve_path(merged.get("AUTOPILOT_DATA_DIR", DEFAULT_DATA_DIR_NAME), home)
+    tasks_file = _resolve_path(merged.get("AUTOPILOT_TASKS_FILE", DEFAULT_TASKS_FILE_NAME), home, "AUTOPILOT_TASKS_FILE")
+    data_dir = _resolve_path(merged.get("AUTOPILOT_DATA_DIR", DEFAULT_DATA_DIR_NAME), home, "AUTOPILOT_DATA_DIR")
     return Settings(
         home=home,
         tasks_file=tasks_file,
@@ -315,7 +323,8 @@ def set_env_value(env_file: Path, key: str, value: str) -> None:
         value: New value, a single line.
 
     Raises:
-        ValueError: If the key is malformed or the value contains a newline.
+        ValueError: If the key is malformed or the value has a newline or any other
+            non-printable character.
         OSError: If the file cannot be read or written.
 
     Example:
@@ -323,11 +332,16 @@ def set_env_value(env_file: Path, key: str, value: str) -> None:
     """
     if not ENV_KEY_RE.match(key):
         raise ValueError(f"Invalid environment variable name '{key}': use A-Z, 0-9 and underscores.")
-    if "\n" in value or "\r" in value:
-        raise ValueError(f"The value for {key} must not contain a newline.")
+    # str.isprintable is False for newlines, other line separators (U+2028, U+0085) and control codes.
+    if not value.isprintable():
+        raise ValueError(f"The value for {key} must be one line of printable characters.")
 
     new_line = f"{key}={_format_env_value(value)}"
-    lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.exists() else []
+    lines = env_file.read_text(encoding="utf-8").split("\n") if env_file.exists() else []
+
+    # Split on "\n" only (not splitlines) so exotic separators can't be mistaken for line ends.
+    if lines and lines[-1] == "":
+        lines.pop()
 
     # Replace the first assignment of the key (and drop duplicates); append when absent.
     updated: list[str] = []

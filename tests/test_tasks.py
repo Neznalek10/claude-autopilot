@@ -6,6 +6,7 @@ task and the field), file loading and the shipped tasks.example.toml.
 
 from __future__ import annotations
 
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from autopilot.errors import ConfigError, ScheduleError
 from autopilot.models import DEFAULT_PERMISSION_MODE, NOTIFY_ALWAYS
 from autopilot.tasks import (
     DEFAULT_ALLOWED_TOOLS,
+    PROTECTED_READ_RULES,
     load_task_config,
     parse_task_config,
 )
@@ -56,7 +58,7 @@ class DefaultsAndMergeTest(TaskConfigTestCase):
         config = self.parse({})
         self.assertEqual(config.tasks, {})
         self.assertEqual(config.ask_options.timeout_seconds, 15 * 60)
-        self.assertEqual(config.ask_options.workdir, self.base)
+        self.assertEqual(config.ask_options.workdir, self.base / "workspace")
 
     def test_minimal_task_gets_builtin_defaults(self) -> None:
         """A task with name and prompt only gets every default."""
@@ -67,9 +69,9 @@ class DefaultsAndMergeTest(TaskConfigTestCase):
         self.assertEqual(task.notify, NOTIFY_ALWAYS)
         self.assertEqual(task.description, "")
         options = task.options
-        self.assertEqual(options.workdir, self.base)
+        self.assertEqual(options.workdir, self.base / "workspace")
         self.assertEqual(options.allowed_tools, DEFAULT_ALLOWED_TOOLS)
-        self.assertEqual(options.disallowed_tools, ())
+        self.assertEqual(options.disallowed_tools, PROTECTED_READ_RULES)
         self.assertEqual(options.permission_mode, DEFAULT_PERMISSION_MODE)
         self.assertEqual(options.timeout_seconds, 30 * 60)
         self.assertIsNone(options.model)
@@ -105,14 +107,14 @@ class DefaultsAndMergeTest(TaskConfigTestCase):
         """Every option key is parsed into RunOptions."""
         task = self.parse({"task": [self.task(
             workdir="work", model="claude-sonnet-4-5", effort="max",
-            allowed_tools=["Read", "Bash(git log *)", "mcp__srv__tool"], disallowed_tools=["Edit"],
+            allowed_tools=["Read", "Bash(git log *)", "mcp__srv__tool"], disallowed_tools=["Edit", "Read(**/.env)"],
             permission_mode="plan", add_dirs=["work", str(self.base)], append_system_prompt="Be brief.",
             max_budget_usd=2, timeout_minutes=720, description="Daily news",
         )]}).tasks["news"]
         options = task.options
         self.assertEqual(options.workdir, self.base / "work")
         self.assertEqual(options.allowed_tools, ("Read", "Bash(git log *)", "mcp__srv__tool"))
-        self.assertEqual(options.disallowed_tools, ("Edit",))
+        self.assertEqual(options.disallowed_tools, ("Edit",) + PROTECTED_READ_RULES)
         self.assertEqual(options.add_dirs, (self.base / "work", self.base))
         self.assertEqual(options.max_budget_usd, 2.0)
         self.assertIsInstance(options.max_budget_usd, float)
@@ -130,6 +132,60 @@ class DefaultsAndMergeTest(TaskConfigTestCase):
         config = self.parse({"task": [self.task(name="b", prompt="Příliš žluťoučký kůň"), self.task(name="a")]})
         self.assertEqual(list(config.tasks), ["b", "a"])
         self.assertEqual(config.tasks["b"].prompt, "Příliš žluťoučký kůň")
+
+
+class SandboxTest(TaskConfigTestCase):
+    """Default workspace folder and the always-denied secret reads."""
+
+    def test_workspace_created_private(self) -> None:
+        """A config without workdir creates <base>/workspace with mode 0o700."""
+        self.parse({"task": [self.task()]})
+        workspace = self.base / "workspace"
+        self.assertTrue(workspace.is_dir())
+        self.assertEqual(stat.S_IMODE(workspace.stat().st_mode), 0o700)
+
+    def test_workspace_not_created_when_workdir_given(self) -> None:
+        """Explicit workdirs everywhere leave no workspace folder behind."""
+        self.parse({"defaults": {"workdir": "work"}, "ask": {"workdir": "work"}, "task": [self.task()]})
+        self.assertFalse((self.base / "workspace").exists())
+
+    def test_every_task_and_ask_get_protected_rules(self) -> None:
+        """Task, task with workdir and [ask] all deny the protected reads."""
+        config = self.parse({"task": [self.task(), self.task(name="b", workdir="work", disallowed_tools=[])]})
+        for options in (config.tasks["news"].options, config.tasks["b"].options, config.ask_options):
+            for rule in PROTECTED_READ_RULES:
+                self.assertIn(rule, options.disallowed_tools)
+
+    def test_protected_paths_become_absolute_read_rules(self) -> None:
+        """Each protected path is denied as Read(//abs/path), deduplicated."""
+        secret = self.base / ".env"
+        config = parse_task_config(
+            {"task": [self.task()]}, self.base, protected_paths=[secret, secret]
+        )
+        rule = f"Read(/{secret})"
+        self.assertTrue(rule.startswith("Read(//"))
+        for options in (config.tasks["news"].options, config.ask_options):
+            self.assertEqual(options.disallowed_tools.count(rule), 1)
+
+    def test_load_task_config_passes_protected_paths(self) -> None:
+        """load_task_config forwards protected_paths."""
+        path = self.base / "tasks.toml"
+        path.write_text('[[task]]\nname = "a"\nprompt = "p"\n', encoding="utf-8")
+        config = load_task_config(path, protected_paths=[self.base / ".env"])
+        self.assertIn(f"Read(/{self.base / '.env'})", config.tasks["a"].options.disallowed_tools)
+
+    def test_model_cannot_start_with_dash(self) -> None:
+        """A model like --help would become a CLI flag, so it is rejected."""
+        for model in ("--help", "-x", ".hidden"):
+            with self.subTest(model=model):
+                self.assertConfigError({"task": [self.task(model=model)]}, "'model'")
+
+    def test_unknown_user_home_is_config_error(self) -> None:
+        """'~nosuchuser/x' gives a ConfigError naming the field, not a RuntimeError."""
+        for field in ("workdir", "add_dirs"):
+            value = "~nosuchuser_zz/x" if field == "workdir" else ["~nosuchuser_zz/x"]
+            with self.subTest(field=field):
+                self.assertConfigError({"task": [self.task(**{field: value})]}, "task 'news'", f"'{field}'")
 
 
 class ScheduleTest(TaskConfigTestCase):
@@ -303,7 +359,13 @@ class ExampleFileTest(unittest.TestCase):
 
     def test_example_loads(self) -> None:
         """tasks.example.toml validates and contains the three documented tasks."""
-        config = load_task_config(PROJECT_ROOT / "tasks.example.toml")
+        # Load a copy in a temp folder so the sandbox folder is not created in the project.
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp).resolve() / "tasks.toml"
+            copy.write_bytes((PROJECT_ROOT / "tasks.example.toml").read_bytes())
+            config = load_task_config(copy)
+            sandbox = copy.parent / "workspace"
+            self.assertTrue(sandbox.is_dir())
         self.assertEqual(list(config.tasks), ["ai-news", "day-plan", "weekly-review"])
         news, plan, review = config.tasks.values()
         self.assertEqual(news.schedules[0].expression, "daily 07:30")
@@ -312,7 +374,12 @@ class ExampleFileTest(unittest.TestCase):
         self.assertEqual(plan.options.allowed_tools, ("Bash(gws calendar *)", "Bash(gws tasks *)"))
         self.assertEqual(review.schedules[0].expression, "sun 19:00")
         self.assertFalse(review.enabled)
-        self.assertEqual(news.options.workdir, Path.home().resolve())
+        self.assertEqual(news.options.workdir, sandbox)
+        self.assertEqual(config.ask_options.workdir, sandbox)
+        self.assertEqual(review.options.workdir, Path.home().resolve())
+        self.assertEqual(review.options.allowed_tools, ("Read", "Glob", "Grep"))
+        for rule in PROTECTED_READ_RULES:
+            self.assertIn(rule, news.options.disallowed_tools)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ Invariants:
       by ``task 'name': ``, ``task #N: `` (name missing) or ``[defaults]: `` /
       ``[ask]: ``, then the field and what is expected.
     * Merge order is built-in defaults, then ``[defaults]``, then the task.
+    * Tasks without a ``workdir`` run in ``<tasks folder>/workspace``, an empty sandbox,
+      and every task and ``[ask]`` always denies PROTECTED_READ_RULES.
     * A schedule that can never fire (``0 0 30 2 *``) fails at load time.
 """
 
@@ -20,7 +22,7 @@ from __future__ import annotations
 import math
 import re
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,12 +45,28 @@ from autopilot.schedule import Schedule, parse_schedule
 TASK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 # A tool rule: Read, WebSearch, mcp__srv__tool, or a pattern such as Bash(git log *).
 TOOL_RULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\(.+\))?$")
-# Model alias or id such as sonnet, claude-sonnet-4-5 or opus[1m].
-MODEL_RE = re.compile(r"^[A-Za-z0-9._\[\]-]+$")
+# Model alias or id such as sonnet, claude-sonnet-4-5 or opus[1m]. It must start with a letter or
+# digit so a value like "--help" can never become an extra command line flag.
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\[\]-]*$")
 
 NAME_HINT = "1-40 characters: lower-case letters, digits, '-' or '_', starting with a letter or digit"
 TOOL_RULE_HINT = "a tool name such as Read, or a rule such as Bash(git log *)"
 MODEL_HINT = "a model alias or id such as sonnet or claude-sonnet-4-5"
+
+WORKSPACE_DIR_NAME = "workspace"
+WORKSPACE_DIR_MODE = 0o700
+
+# Read rules that are always denied, so a prompt injected through a fetched web page cannot
+# make Claude read secrets (the bot token in .env, login credentials, keys) and send them out.
+PROTECTED_READ_RULES = (
+    "Read(**/.env)",
+    "Read(**/.env.*)",
+    "Read(~/.ssh/**)",
+    "Read(~/.aws/**)",
+    "Read(~/.gnupg/**)",
+    "Read(~/.claude/.credentials.json)",
+    "Read(~/.config/gws/**)",
+)
 
 DEFAULT_ALLOWED_TOOLS = ("Read", "Glob", "Grep", "WebSearch", "WebFetch")
 DEFAULT_TIMEOUT_MINUTES = 30
@@ -139,7 +157,11 @@ def _parse_bool(value: Any, label: str, key: str) -> bool:
 def _parse_directory(value: Any, label: str, key: str, base_dir: Path) -> Path:
     """Expand ``~``, resolve against ``base_dir`` and require an existing directory."""
     raw = _parse_text(value, label, key)
-    path = Path(raw).expanduser()
+    try:
+        path = Path(raw).expanduser()
+    except RuntimeError:
+        # expanduser raises RuntimeError for "~user" when that user does not exist.
+        raise _fail(label, f"'{key}' uses '{raw}', but that home folder cannot be found.") from None
     if not path.is_absolute():
         path = base_dir / path
     path = path.resolve()
@@ -178,28 +200,59 @@ def _parse_timeout_seconds(value: Any, label: str, key: str) -> int:
     return value * SECONDS_PER_MINUTE
 
 
+def _default_workdir(base_dir: Path) -> Path:
+    """Return the sandbox folder ``<base_dir>/workspace``, creating it (mode 0o700) when missing.
+
+    Tasks without a ``workdir`` run here, in an empty folder, rather than in the project
+    folder that holds ``.env`` and the bot token.
+    """
+    workspace = base_dir.resolve() / WORKSPACE_DIR_NAME
+    if not workspace.exists():
+        workspace.mkdir(mode=WORKSPACE_DIR_MODE, parents=True, exist_ok=True)
+        workspace.chmod(WORKSPACE_DIR_MODE)
+    return workspace
+
+
+def _protected_rules(protected_paths: Sequence[Path]) -> tuple[str, ...]:
+    """Return the deny rules that always apply: built-in secrets plus ``protected_paths``.
+
+    A path becomes ``Read(//abs/path)``: the double slash is Claude Code's absolute-path form.
+    """
+    extra = tuple(f"Read(/{path.expanduser().resolve()})" for path in protected_paths)
+    return tuple(dict.fromkeys(PROTECTED_READ_RULES + extra))
+
+
 def _optional(raw: Mapping[str, Any], key: str, parse: Callable[[Any], Any], default: Any = None) -> Any:
     """Return ``parse(raw[key])`` when the key is present, else ``default``."""
     return parse(raw[key]) if key in raw else default
 
 
 def _build_options(
-    raw: Mapping[str, Any], label: str, base_dir: Path, default_timeout_minutes: int
+    raw: Mapping[str, Any],
+    label: str,
+    base_dir: Path,
+    default_timeout_minutes: int,
+    protected_rules: tuple[str, ...],
 ) -> RunOptions:
     """Validate the option keys in ``raw`` (already merged) and build RunOptions.
 
     Args:
         raw: Merged option values from TOML; keys outside OPTION_KEYS are ignored.
         label: Error prefix naming the task (or [defaults] / [ask]).
-        base_dir: Folder against which relative paths resolve; also the default workdir.
+        base_dir: Folder against which relative paths resolve; its ``workspace`` sub folder
+            is the default workdir.
         default_timeout_minutes: Timeout used when ``timeout_minutes`` is absent.
+        protected_rules: Deny rules appended (deduplicated) to ``disallowed_tools``.
 
     Raises:
         ConfigError: On the first invalid value.
     """
-    workdir = _optional(
-        raw, "workdir", lambda v: _parse_directory(v, label, "workdir", base_dir), base_dir.resolve()
-    )
+    if "workdir" in raw:
+        workdir = _parse_directory(raw["workdir"], label, "workdir", base_dir)
+    else:
+        workdir = _default_workdir(base_dir)
+    # Protected rules come last and can't be removed by the user's own list.
+    disallowed = _optional(raw, "disallowed_tools", lambda v: _parse_tool_list(v, label, "disallowed_tools"), ())
     timeout_seconds = _optional(
         raw,
         "timeout_minutes",
@@ -213,9 +266,7 @@ def _build_options(
         allowed_tools=_optional(
             raw, "allowed_tools", lambda v: _parse_tool_list(v, label, "allowed_tools"), DEFAULT_ALLOWED_TOOLS
         ),
-        disallowed_tools=_optional(
-            raw, "disallowed_tools", lambda v: _parse_tool_list(v, label, "disallowed_tools"), ()
-        ),
+        disallowed_tools=tuple(dict.fromkeys(disallowed + protected_rules)),
         permission_mode=_optional(
             raw,
             "permission_mode",
@@ -278,6 +329,7 @@ def _parse_task(
     base_dir: Path,
     seen: set[str],
     now: datetime,
+    protected_rules: tuple[str, ...],
 ) -> Task:
     """Validate one ``[[task]]`` table merged over ``[defaults]`` and build a Task.
 
@@ -288,6 +340,7 @@ def _parse_task(
         base_dir: Folder for relative paths.
         seen: Names already used; this task's name is added on success.
         now: Aware moment for the schedule check.
+        protected_rules: Deny rules appended to the task's ``disallowed_tools``.
 
     Raises:
         ConfigError: On any invalid or missing field.
@@ -315,7 +368,7 @@ def _parse_task(
         name=name,
         prompt=prompt,
         schedules=_parse_schedules(entry.get("schedule"), label, now),
-        options=_build_options(merged, label, base_dir, DEFAULT_TIMEOUT_MINUTES),
+        options=_build_options(merged, label, base_dir, DEFAULT_TIMEOUT_MINUTES, protected_rules),
         description=description,
         enabled=enabled,
         notify=notify,
@@ -324,14 +377,23 @@ def _parse_task(
     return task
 
 
-def parse_task_config(data: Mapping[str, Any], base_dir: Path, *, source: Path | None = None) -> TaskConfig:
+def parse_task_config(
+    data: Mapping[str, Any],
+    base_dir: Path,
+    *,
+    source: Path | None = None,
+    protected_paths: Sequence[Path] = (),
+) -> TaskConfig:
     """Validate parsed TOML data and build a TaskConfig.
 
     Args:
         data: The dict produced by ``tomllib`` (top-level keys defaults, ask, task).
-        base_dir: Folder against which relative workdir and add_dirs resolve;
-            also the default workdir.
+        base_dir: Folder against which relative workdir and add_dirs resolve. Tasks
+            without a workdir run in ``<base_dir>/workspace`` (created, mode 0o700).
         source: The file the data came from, stored on the result.
+        protected_paths: Files Claude must never read (e.g. the ``.env`` file). Each is
+            denied as ``Read(//abs/path)``, on top of PROTECTED_READ_RULES, for every
+            task and for ``[ask]``.
 
     Returns:
         The validated config with tasks in file order.
@@ -355,13 +417,16 @@ def parse_task_config(data: Mapping[str, Any], base_dir: Path, *, source: Path |
     _check_keys(ask, ASK_KEYS, ASK_LABEL)
 
     # Validate [defaults] on its own so a bad default is blamed on [defaults], not on every task.
-    _build_options(defaults, DEFAULTS_LABEL, base_dir, DEFAULT_TIMEOUT_MINUTES)
+    protected_rules = _protected_rules(protected_paths)
+    _build_options(defaults, DEFAULTS_LABEL, base_dir, DEFAULT_TIMEOUT_MINUTES, protected_rules)
     _optional(defaults, "notify", lambda v: _parse_choice(v, DEFAULTS_LABEL, "notify", NOTIFY_POLICIES))
     _optional(defaults, "enabled", lambda v: _parse_bool(v, DEFAULTS_LABEL, "enabled"))
 
     # Ask options inherit the option keys from [defaults] but keep their own timeout default.
     default_options = {key: value for key, value in defaults.items() if key in OPTION_KEYS}
-    ask_options = _build_options({**default_options, **ask}, ASK_LABEL, base_dir, DEFAULT_ASK_TIMEOUT_MINUTES)
+    ask_options = _build_options(
+        {**default_options, **ask}, ASK_LABEL, base_dir, DEFAULT_ASK_TIMEOUT_MINUTES, protected_rules
+    )
 
     raw_tasks = data.get("task", [])
     if not isinstance(raw_tasks, list):
@@ -372,16 +437,17 @@ def parse_task_config(data: Mapping[str, Any], base_dir: Path, *, source: Path |
     seen: set[str] = set()
     for index, entry in enumerate(raw_tasks, start=1):
         table = _as_table(entry, f"tasks.toml: task #{index}: ", "each [[task]] entry")
-        task = _parse_task(table, index, defaults, base_dir, seen, now)
+        task = _parse_task(table, index, defaults, base_dir, seen, now, protected_rules)
         tasks[task.name] = task
     return TaskConfig(tasks=tasks, ask_options=ask_options, source=source)
 
 
-def load_task_config(path: Path) -> TaskConfig:
+def load_task_config(path: Path, *, protected_paths: Sequence[Path] = ()) -> TaskConfig:
     """Read, parse and validate a tasks.toml file.
 
     Args:
         path: Location of tasks.toml; relative paths in it resolve against its folder.
+        protected_paths: Files Claude must never read; see ``parse_task_config``.
 
     Returns:
         The validated TaskConfig with ``source`` set to ``path``.
@@ -403,4 +469,4 @@ def load_task_config(path: Path) -> TaskConfig:
         raise ConfigError(f"tasks.toml: invalid TOML in {path}: {err}") from err
     except (OSError, UnicodeDecodeError) as err:
         raise ConfigError(f"tasks.toml: cannot read {path}: {err}") from err
-    return parse_task_config(data, path.parent, source=path)
+    return parse_task_config(data, path.parent, source=path, protected_paths=protected_paths)
