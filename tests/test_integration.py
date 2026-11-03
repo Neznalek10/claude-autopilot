@@ -52,6 +52,7 @@ from autopilot.errors import ConfigError, TelegramError
 from autopilot.models import (
     ASK_TASK_NAME,
     STATUS_CANCELLED,
+    STATUS_ERROR,
     STATUS_RATE_LIMITED,
     STATUS_SUCCESS,
     STATUS_TIMEOUT,
@@ -66,7 +67,7 @@ from autopilot.service import UNIT_NAME, install_service, uninstall_service
 from autopilot.settings import Settings, load_settings
 from autopilot.store import Store
 from autopilot.system import run_command
-from autopilot.tasks import load_task_config
+from autopilot.tasks import PROTECTED_READ_RULES, load_task_config
 from autopilot.telegram_api import TelegramClient
 from helpers import (
     FAKE_BOT_USERNAME,
@@ -245,20 +246,28 @@ class IntegrationCase(unittest.TestCase):
 
     # ------------------------------------------------------------------ drive
 
-    def send(self, app: App, text: str, *, chat_id: int = CHAT_ID) -> None:
+    def send(
+        self, app: App, text: str, *, chat_id: int = CHAT_ID, sender_id: int | None = None
+    ) -> None:
         """Deliver one Telegram text message to the bot.
 
         Args:
             app: App with a bot.
             text: Message text.
             chat_id: Chat the message comes from.
+            sender_id: User who sent it; defaults to ``chat_id`` (a private chat).
         """
         assert app.bot is not None
         self.update_counter += 1
         app.bot.handle_update(
             {
                 "update_id": self.update_counter,
-                "message": {"message_id": self.update_counter, "chat": {"id": chat_id}, "text": text},
+                "message": {
+                    "message_id": self.update_counter,
+                    "chat": {"id": chat_id},
+                    "from": {"id": chat_id if sender_id is None else sender_id},
+                    "text": text,
+                },
             }
         )
 
@@ -351,7 +360,8 @@ enabled = false
         self.assertEqual(task.options.workdir, workdir)
         self.assertEqual((task.options.model, task.options.effort), ("sonnet", "high"))
         self.assertEqual(task.options.allowed_tools, ("Read", "Bash(git log *)"))
-        self.assertEqual(task.options.disallowed_tools, ("WebFetch",))
+        self.assertEqual(task.options.disallowed_tools[0], "WebFetch")
+        self.assertEqual(task.options.disallowed_tools[1:], PROTECTED_READ_RULES)
         self.assertEqual(task.options.permission_mode, "acceptEdits")
         self.assertEqual(task.options.max_budget_usd, 1.5)
         self.assertEqual(task.options.timeout_seconds, 7 * 60)
@@ -487,6 +497,23 @@ class AC3RunTests(IntegrationCase):
         self.assertEqual(argument_after(argv, "--model"), "sonnet")
         self.assertEqual(call["cwd"], str(workdir))
         self.assertFalse(call["has_api_key"])
+
+    def test_secrets_are_denied_and_a_task_without_workdir_runs_in_the_workspace(self) -> None:
+        """The real argv denies reading secrets (incl. .env) and the default cwd is the empty workspace."""
+        app = self.build()
+        run_id = app.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False)
+        assert run_id is not None
+        app.engine.execute_run(run_id)
+
+        (call,) = self.claude_calls()
+        argv = call["argv"]
+        denied = argv[argv.index("--disallowedTools") + 1 :]
+        for rule in PROTECTED_READ_RULES:
+            self.assertIn(rule, denied)
+        self.assertIn(f"Read(/{self.home / '.env'})", denied)
+        workspace = self.home / "workspace"
+        self.assertEqual(call["cwd"], str(workspace))
+        self.assertEqual(stat.S_IMODE(workspace.stat().st_mode), 0o700)
 
     def test_default_runner_resolves_claude_bin_and_strips_the_api_key(self) -> None:
         """build_app without a custom runner finds CLAUDE_BIN and still keeps API keys out of the child."""
@@ -775,6 +802,15 @@ class AC8BotTests(IntegrationCase):
         self.assertEqual(self.client.chat_actions, [])
         self.assertEqual(app.store.list_runs(), [])
 
+    def test_group_chat_and_foreign_sender_in_the_owner_chat_are_ignored(self) -> None:
+        """Only the owner's private chat is accepted: a group, or another user posting there, gets no answer."""
+        app = self.build()
+        with self.assertLogs("autopilot.bot", logging.WARNING):
+            self.send(app, "/run news", chat_id=-100123)  # a group chat id
+            self.send(app, "/run news", chat_id=CHAT_ID, sender_id=FOREIGN_CHAT_ID)
+        self.assertEqual(self.client.sent, [])
+        self.assertEqual(app.store.list_runs(), [])
+
     def test_commands(self) -> None:
         """Each command produces its documented reply or side effect."""
         app = self.build()
@@ -827,17 +863,21 @@ class AC8BotTests(IntegrationCase):
     def test_service_polls_telegram_answers_and_announces_itself(self) -> None:
         """run_service starts the bot thread: it registers commands, greets, answers and stops cleanly."""
         app = self.build()
+        leftover = app.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="old", queued_at=self.clock())
         stop = threading.Event()
         self.addCleanup(stop.set)
         service = threading.Thread(target=run_service, args=(app, stop), daemon=True)
         service.start()
         self.wait_for_messages(1)
         self.assertIn("Autopilot is running", self.texts()[0])
+        interrupted = app.store.get_run(leftover)
+        assert interrupted is not None
+        self.assertEqual(interrupted.status, STATUS_ERROR)  # a run left by a previous process is closed at startup
         self.wait_until(lambda: self.client.commands is not None, "the command menu to be registered")
         self.assertEqual(self.client.commands, list(BOT_COMMANDS))
 
         self.client.updates.append(
-            [{"update_id": 41, "message": {"chat": {"id": CHAT_ID}, "text": "ping"}}]
+            [{"update_id": 41, "message": {"chat": {"id": CHAT_ID}, "from": {"id": CHAT_ID}, "text": "ping"}}]
         )
         self.wait_until(lambda: "echo: ping" in self.texts(), "the chat answer")
         self.wait_until(lambda: app.store.get_value(OFFSET_KEY) == "42", "the poll offset to be stored")
@@ -1016,7 +1056,15 @@ class AC12TelegramSetupTests(IntegrationCase):
     def test_setup_saves_credentials_and_confirms(self) -> None:
         """The first message to the bot yields the chat id; token and id land in a private .env."""
         settings = self.make_settings(telegram=False)
-        self.client.updates = [[{"update_id": 7, "message": {"chat": {"id": 555}, "text": "hi"}}]]
+        private = {"id": 555, "type": "private", "first_name": "Example"}
+        self.client.updates = [
+            # Drained first: a message sent before the setup started must not pick the chat.
+            [{"update_id": 3, "message": {"chat": {"id": 111, "type": "private"}, "text": "old"}}],
+            [
+                {"update_id": 6, "message": {"chat": {"id": -100, "type": "group"}, "text": "group"}},
+                {"update_id": 7, "message": {"chat": private, "from": {"id": 555}, "text": "hi"}},
+            ],
+        ]
         out = io.StringIO()
         chat_id = telegram_setup(
             settings,
@@ -1024,6 +1072,7 @@ class AC12TelegramSetupTests(IntegrationCase):
             out=out,
             client_factory=lambda _token: self.client,
             wait_seconds=5,
+            confirm=lambda _prompt: "y",
         )
 
         self.assertEqual(chat_id, 555)
@@ -1145,6 +1194,7 @@ class AC15ChatTests(IntegrationCase):
         self.send(app, "/new")
         self.assertIn("New conversation", self.texts()[-1])
         self.assertIsNone(app.store.get_value(CHAT_SESSION_KEY))
+        self.clock.advance(seconds=1)  # a turn queued at the moment of /new never stores its session
         self.chat(app, "fresh start", 4)
         self.assertNotIn("--resume", self.claude_calls()[2]["argv"])
         self.assertNotEqual(app.store.get_value(CHAT_SESSION_KEY), first_session)
