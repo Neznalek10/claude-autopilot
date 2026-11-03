@@ -142,6 +142,13 @@ class RenderUnitTest(unittest.TestCase):
         self.assertIn('Environment="PATH=/usr/bin:%%h"', text)
         self.assertIn("ExecStart=/srv/%%u/python -m autopilot start", text)
 
+    def test_dollar_signs_in_exec_start_are_doubled_so_systemd_keeps_them_literal(self) -> None:
+        """systemd expands $NAME in ExecStart, so a $ in the interpreter path is written as $$."""
+        quoted = self.render(python="/home/a b/$HOME/venv/bin/python")
+        self.assertIn('ExecStart="/home/a b/$$HOME/venv/bin/python" -m autopilot start', quoted)
+        bare = self.render(python="/srv/${NAME}/python")
+        self.assertIn("ExecStart=/srv/$${NAME}/python -m autopilot start", bare)
+
     def test_interpreter_path_with_spaces_is_quoted_in_exec_start(self) -> None:
         """A space in the interpreter path would split ExecStart, so the path is quoted."""
         text = self.render(python="/opt/my venv/bin/python")

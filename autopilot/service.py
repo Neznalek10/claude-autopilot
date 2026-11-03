@@ -264,6 +264,8 @@ def _exec_word(text: str) -> str:
 
     Words without spaces or special characters stay bare, so the unit reads
     naturally. Anything else is quoted with the same escaping as assignments.
+    ExecStart also expands ``$NAME`` and ``${NAME}`` from the environment, so every
+    ``$`` is doubled; ``$$`` is systemd's literal dollar sign.
 
     Args:
         text: One command word, e.g. the interpreter path.
@@ -272,9 +274,10 @@ def _exec_word(text: str) -> str:
         The word as it should appear in ExecStart.
     """
     needs_quotes = any(char.isspace() or char in EXEC_WORD_SPECIAL_CHARACTERS for char in text)
+    literal_dollars = text.replace("$", "$$")
     if needs_quotes:
-        return _quote(text)
-    return _escape_specifiers(text)
+        return _quote(literal_dollars)
+    return _escape_specifiers(literal_dollars)
 
 
 def _write_unit_file(unit_dir: Path, content: str) -> Path:
