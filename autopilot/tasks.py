@@ -35,6 +35,7 @@ from autopilot.models import (
     NOTIFY_ALWAYS,
     NOTIFY_POLICIES,
     PERMISSION_MODES,
+    SECONDS_PER_MINUTE,
     RunOptions,
     Task,
     TaskConfig,
@@ -72,7 +73,6 @@ DEFAULT_ALLOWED_TOOLS = ("Read", "Glob", "Grep", "WebSearch", "WebFetch")
 DEFAULT_TIMEOUT_MINUTES = 30
 DEFAULT_ASK_TIMEOUT_MINUTES = 15
 MAX_TIMEOUT_MINUTES = 720
-SECONDS_PER_MINUTE = 60
 
 TOP_LEVEL_KEYS = ("defaults", "ask", "task")
 OPTION_KEYS = (

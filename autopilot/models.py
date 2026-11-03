@@ -71,8 +71,13 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # Never prompts, so an unattended run can't hang waiting for an answer.
 DEFAULT_PERMISSION_MODE = "dontAsk"
 
+# Time units shared by every module that converts durations.
+MILLISECONDS_PER_SECOND = 1000
+SECONDS_PER_MINUTE = 60
+MINUTES_PER_HOUR = 60
+
 # Default run timeout when tasks.toml sets none: 30 minutes.
-DEFAULT_TIMEOUT_SECONDS = 1800
+DEFAULT_TIMEOUT_SECONDS = 30 * SECONDS_PER_MINUTE
 
 # A chat conversation idle for this many hours starts fresh with the next message.
 CHAT_IDLE_HOURS = 6

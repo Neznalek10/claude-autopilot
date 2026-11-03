@@ -59,6 +59,9 @@ DEFAULT_HISTORY_LIMIT = 10
 DEFAULT_NEXT_COUNT = 5
 DEFAULT_SETUP_WAIT_SECONDS = 120
 SUMMARY_WIDTH = 60
+
+# argparse has no public name for the object add_subparsers() returns.
+SubParsers = argparse._SubParsersAction
 TABLE_GAP = "  "
 NO_VALUE = "-"
 # Level for commands that are not the service: only problems reach the terminal.
@@ -125,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_command(
-    commands: argparse._SubParsersAction,  # noqa: SLF001 - argparse exposes no public type
+    commands: SubParsers,
     common: argparse.ArgumentParser,
     name: str,
     handler: Handler,
@@ -145,7 +148,7 @@ def _add_command(
     return sub
 
 
-def _add_run_commands(commands: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:  # noqa: SLF001
+def _add_run_commands(commands: SubParsers, common: argparse.ArgumentParser) -> None:
     """Register `init`, `start`, `run` and `ask`."""
     _add_command(commands, common, "init", _cmd_init,
                  "create tasks.toml and .env from the examples", "autopilot init")
@@ -161,7 +164,7 @@ def _add_run_commands(commands: argparse._SubParsersAction, common: argparse.Arg
     ask.add_argument("--no-notify", action="store_true", help="do not send the answer to Telegram")
 
 
-def _add_inspect_commands(commands: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:  # noqa: SLF001
+def _add_inspect_commands(commands: SubParsers, common: argparse.ArgumentParser) -> None:
     """Register `list`, `history` and `show`."""
     _add_command(commands, common, "list", _cmd_list,
                  "show tasks, schedules and next runs", "autopilot list")
@@ -177,7 +180,7 @@ def _add_inspect_commands(commands: argparse._SubParsersAction, common: argparse
     show.add_argument("run_id", type=int, help="run id from `autopilot history`")
 
 
-def _add_schedule_commands(commands: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:  # noqa: SLF001
+def _add_schedule_commands(commands: SubParsers, common: argparse.ArgumentParser) -> None:
     """Register `pause`, `resume`, `next` and `validate`."""
     pause = _add_command(commands, common, "pause", _cmd_pause,
                          "stop a task's schedule", "autopilot pause ai-news")
@@ -196,7 +199,7 @@ def _add_schedule_commands(commands: argparse._SubParsersAction, common: argpars
                  "check tasks.toml and list its tasks", "autopilot validate")
 
 
-def _add_setup_commands(commands: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:  # noqa: SLF001
+def _add_setup_commands(commands: SubParsers, common: argparse.ArgumentParser) -> None:
     """Register `doctor`, `telegram-setup`, `install-service` and `uninstall-service`."""
     doctor = _add_command(commands, common, "doctor", _cmd_doctor,
                           "check the whole setup", "autopilot doctor --live")

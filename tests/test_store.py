@@ -420,17 +420,17 @@ class PermissionTests(unittest.TestCase):
             self.assertEqual(db_path.parent.stat().st_mode & 0o777, 0o700)
             self.assertEqual(db_path.stat().st_mode & 0o777, 0o600)
 
-    def test_existing_open_folder_and_database_are_tightened(self) -> None:
-        """Opening a store fixes a group- or world-readable folder and database."""
+    def test_existing_folder_keeps_its_mode_but_database_is_tightened(self) -> None:
+        """A folder the user chose keeps its mode; a readable database becomes 0600."""
         with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp) / "data"
-            folder.mkdir(mode=0o755)
+            folder = Path(tmp) / "shared"
+            folder.mkdir()
+            folder.chmod(0o755)
             db_path = folder / "autopilot.db"
             Store(db_path)
-            folder.chmod(0o755)
             db_path.chmod(0o644)
             Store(db_path)
-            self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(folder.stat().st_mode & 0o777, 0o755)
             self.assertEqual(db_path.stat().st_mode & 0o777, 0o600)
 
 

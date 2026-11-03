@@ -82,7 +82,21 @@ class EngineAPI(Protocol):
         retry_of: int | None = None,
         dispatch: bool = True,
     ) -> int | None:
-        """Queue a task run; None when the task already has an active run."""
+        """Queue a run of a task from tasks.toml.
+
+        Args:
+            name: Task name.
+            trigger: What started the run (bot commands use TRIGGER_TELEGRAM).
+            scheduled_for: Schedule slot the run belongs to, if any.
+            retry_of: Id of the run this one retries, if any.
+            dispatch: Put the run on the worker queue right away.
+
+        Returns:
+            The new run id, or None when the task already has an active run.
+
+        Raises:
+            TaskNotFoundError: If no task has that name.
+        """
         ...
 
     def enqueue_prompt(
@@ -93,7 +107,20 @@ class EngineAPI(Protocol):
         retry_of: int | None = None,
         dispatch: bool = True,
     ) -> int:
-        """Queue a one-off prompt run and return its id."""
+        """Queue a chat turn or one-off prompt.
+
+        Args:
+            prompt: The text to send to Claude.
+            trigger: TRIGGER_CHAT continues the conversation; TRIGGER_MANUAL is one-off.
+            retry_of: Id of the run this one retries, if any.
+            dispatch: Put the run on the worker queue right away.
+
+        Returns:
+            The new run id.
+
+        Raises:
+            ValueError: If the prompt is empty.
+        """
         ...
 
     def reset_chat(self) -> None:

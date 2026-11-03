@@ -172,12 +172,15 @@ class Store:
             OSError: If the folder or file permissions cannot be set.
 
         Side effects:
-            Sets the data folder to mode 0o700 and the database file to 0o600.
+            Creates a missing data folder with mode 0o700 and sets the database
+            file to 0o600.
         """
         self._db_path = db_path
-        db_path.parent.mkdir(mode=PRIVATE_DIR_MODE, parents=True, exist_ok=True)
-        # mkdir's mode is filtered by the umask and skipped for an existing folder.
-        db_path.parent.chmod(PRIVATE_DIR_MODE)
+        if not db_path.parent.exists():
+            db_path.parent.mkdir(mode=PRIVATE_DIR_MODE, parents=True)
+            # mkdir's mode is filtered by the umask. A folder the user chose and
+            # that already exists keeps its own permissions.
+            db_path.parent.chmod(PRIVATE_DIR_MODE)
         with self._connect() as conn:
             # WAL lets readers and one writer work at once; the mode is stored in the file.
             conn.execute("PRAGMA journal_mode=WAL")
@@ -425,6 +428,9 @@ class Store:
 
         Returns:
             Records with status rate_limited and retry_at <= now, oldest first.
+
+        Raises:
+            ValueError: If now is naive.
         """
         if now.utcoffset() is None:
             raise ValueError(f"Expected a timezone-aware datetime, got naive {now!r}")

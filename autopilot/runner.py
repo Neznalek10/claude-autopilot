@@ -42,6 +42,8 @@ from typing import Any
 
 from autopilot.errors import ClaudeNotFoundError
 from autopilot.models import (
+    MILLISECONDS_PER_SECOND,
+    SECONDS_PER_MINUTE,
     STATUS_ERROR,
     STATUS_RATE_LIMITED,
     STATUS_SUCCESS,
@@ -112,9 +114,6 @@ MAX_HOUR_24 = 23
 MAX_MINUTE = 59
 MAX_HOUR_12 = 12
 HOURS_PER_HALF_DAY = 12
-
-SECONDS_PER_MINUTE = 60
-MILLISECONDS_PER_SECOND = 1000
 
 # Messages for results that carry no text, keyed by the JSON "subtype".
 SUBTYPE_MESSAGES = {

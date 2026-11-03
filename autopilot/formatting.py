@@ -30,6 +30,9 @@ from autopilot.models import (
     ASK_TASK_NAME,
     BOT_COMMANDS,
     CHAT_IDLE_HOURS,
+    MILLISECONDS_PER_SECOND,
+    MINUTES_PER_HOUR,
+    SECONDS_PER_MINUTE,
     STATUS_SUCCESS,
     STATUS_TIMEOUT,
     TRIGGER_CHAT,
@@ -72,10 +75,6 @@ RECENT_DAYS = 6
 # Separators added around a result chunk in a message: after the header, before the
 # attachment note and before the blocked-tools notice.
 RESERVED_SEPARATORS = 3
-
-MS_PER_SECOND = 1000
-SECONDS_PER_MINUTE = 60
-MINUTES_PER_HOUR = 60
 
 EMPTY_RESULT_HTML = "<i>(no text output)</i>"
 ATTACHED_NOTE = "<i>Full result attached as a file.</i>"
@@ -260,9 +259,9 @@ def format_duration(ms: int | None) -> str:
     if ms is None:
         return "?"
     ms = max(ms, 0)
-    if ms < MS_PER_SECOND:
+    if ms < MILLISECONDS_PER_SECOND:
         return f"{ms} ms"
-    seconds = ms // MS_PER_SECOND
+    seconds = ms // MILLISECONDS_PER_SECOND
     if seconds < SECONDS_PER_MINUTE:
         return f"{seconds}s"
     minutes, seconds = divmod(seconds, SECONDS_PER_MINUTE)

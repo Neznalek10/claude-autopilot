@@ -30,6 +30,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 
 from autopilot.errors import ScheduleError
+from autopilot.models import MINUTES_PER_HOUR
 
 # Index = date.weekday().
 WEEKDAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -54,7 +55,6 @@ ALL_WEEKDAYS = frozenset(range(7))
 MON_TO_FRI = frozenset(range(5))
 SAT_AND_SUN = frozenset({5, 6})
 
-MINUTES_PER_HOUR = 60
 HOURS_PER_DAY = 24
 LAST_MINUTE = MINUTES_PER_HOUR - 1
 LAST_HOUR = HOURS_PER_DAY - 1
