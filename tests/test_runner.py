@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -138,6 +139,13 @@ class FindClaudeBinaryTests(unittest.TestCase):
         with self.assertRaises(ClaudeNotFoundError) as caught:
             self.find(str(self.home / "nope"))
         self.assertIn(str(self.home / "nope"), str(caught.exception))
+
+    def test_configured_unknown_user_home_is_a_clean_error(self) -> None:
+        """A CLAUDE_BIN like ~nosuchuser/claude gives ClaudeNotFoundError naming the value."""
+        value = "~nosuchuser-autopilot/claude"
+        with self.assertRaises(ClaudeNotFoundError) as caught:
+            self.find(value)
+        self.assertIn(value, str(caught.exception))
 
     def test_configured_non_executable_is_rejected(self) -> None:
         """A CLAUDE_BIN that exists but isn't executable is rejected."""
@@ -308,6 +316,20 @@ class ChildEnvironmentTests(unittest.TestCase):
             {"CLAUDE_CODE_OAUTH_TOKEN": "tok", "CLAUDE_CONFIG_DIR": "/cfg"},
         )
 
+    def test_strips_every_telegram_variable(self) -> None:
+        """TELEGRAM_* variables (the bot token and chat id) never reach the child."""
+        base = {
+            "TELEGRAM_BOT_TOKEN": "123456:secret",
+            "TELEGRAM_CHAT_ID": "42",
+            "TELEGRAM_ANYTHING": "x",
+            "TELEGRAMS": "kept: not a TELEGRAM_ variable",
+            "PATH": "/usr/bin",
+        }
+        self.assertEqual(
+            child_environment(base),
+            {"TELEGRAMS": "kept: not a TELEGRAM_ variable", "PATH": "/usr/bin"},
+        )
+
     def test_does_not_modify_the_input(self) -> None:
         """The base mapping is left untouched."""
         base = {"ANTHROPIC_API_KEY": "secret"}
@@ -388,6 +410,55 @@ class DetectRateLimitTests(unittest.TestCase):
             detect_rate_limit("usage limit resets 17:00", NOW)[1],
             datetime(2026, 11, 2, 17, 2, tzinfo=TZ),
         )
+
+    def test_real_weekly_wording_with_zone_name(self) -> None:
+        """The wording seen in practice, with a trailing zone name, still reads 22:20."""
+        text = "You've hit your session limit · resets 10:20pm (Europe/Prague)"
+        self.assertEqual(
+            detect_rate_limit(text, NOW)[1], datetime(2026, 11, 2, 22, 22, tzinfo=TZ)
+        )
+
+    def test_month_and_day_before_the_time(self) -> None:
+        """'resets Nov 7, 9am' and 'resets Nov 7 at 9:30am' read the named date."""
+        cases = {
+            "weekly limit reached, resets Nov 7, 9am": datetime(2026, 11, 7, 9, 2, tzinfo=TZ),
+            "weekly limit reached, resets Nov 7 at 9:30am": datetime(2026, 11, 7, 9, 32, tzinfo=TZ),
+            "weekly limit reached, resets November 7th 9am": datetime(2026, 11, 7, 9, 2, tzinfo=TZ),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(detect_rate_limit(text, NOW), (True, expected))
+
+    def test_weekday_before_the_time(self) -> None:
+        """'resets Thu 9am' is the next Thursday 09:00 (NOW is a Monday)."""
+        _, retry_at = detect_rate_limit("weekly limit reached, resets Thu 9am", NOW)
+        self.assertEqual(retry_at, datetime(2026, 11, 5, 9, 2, tzinfo=TZ))
+
+    def test_same_weekday_with_time_passed_means_next_week(self) -> None:
+        """'resets Mon 9am' at Monday 15:00 is seven days ahead, still inside the 8-day cap."""
+        _, retry_at = detect_rate_limit("weekly limit reached, resets Mon 9am", NOW)
+        self.assertEqual(retry_at, datetime(2026, 11, 9, 9, 2, tzinfo=TZ))
+
+    def test_same_weekday_with_time_ahead_means_today(self) -> None:
+        """'resets Mon 5pm' at Monday 15:00 is today."""
+        _, retry_at = detect_rate_limit("weekly limit reached, resets Mon 5pm", NOW)
+        self.assertEqual(retry_at, datetime(2026, 11, 2, 17, 2, tzinfo=TZ))
+
+    def test_named_date_beyond_eight_days_gives_no_time(self) -> None:
+        """A date more than 8 days away, or one that already passed this year, gives no time."""
+        for text in ("usage limit resets Nov 20, 9am", "usage limit resets Nov 1, 9am"):
+            with self.subTest(text=text):
+                self.assertEqual(detect_rate_limit(text, NOW), (True, None))
+
+    def test_month_day_rolls_into_next_year(self) -> None:
+        """'resets Jan 2, 9am' on 30 December means 2 January of the next year."""
+        late_december = datetime(2026, 12, 30, 12, 0, tzinfo=TZ)
+        _, retry_at = detect_rate_limit("weekly limit reached, resets Jan 2, 9am", late_december)
+        self.assertEqual(retry_at, datetime(2027, 1, 2, 9, 2, tzinfo=TZ))
+
+    def test_impossible_date_gives_no_time(self) -> None:
+        """'resets Feb 30, 9am' is a limit without a usable time."""
+        self.assertEqual(detect_rate_limit("usage limit resets Feb 30, 9am", NOW), (True, None))
 
     def test_invalid_clock_values_give_no_time(self) -> None:
         """Impossible hours or minutes are reported as a limit without a retry time."""
@@ -704,6 +775,7 @@ class ClaudeRunnerTests(unittest.TestCase):
         """ClaudeNotFoundError from the resolver is reported as an error outcome."""
 
         def missing() -> Path:
+            """A resolver that always fails, like find_claude_binary on an empty machine."""
             raise ClaudeNotFoundError("Claude Code CLI not found. Checked: nowhere.")
 
         outcome = ClaudeRunner(missing, clock=self.clock, base_env=self.env).run(
@@ -765,6 +837,82 @@ class ClaudeRunnerTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.runner.run("hi", self.options())
         self.assert_no_leftover_processes()
+
+    def start_in_background(self, active_runner: ClaudeRunner, prompt: str, **option_overrides):
+        """Run a prompt on a thread and wait until its process exists.
+
+        Args:
+            active_runner: The runner to use.
+            prompt: Prompt text, e.g. ``FAKE_SLEEP 30``.
+            **option_overrides: RunOptions fields, e.g. ``timeout_seconds=60``.
+
+        Returns:
+            ``(thread, outcomes)``; the run's outcome is appended to ``outcomes`` when it ends.
+        """
+        outcomes = []
+        thread = threading.Thread(
+            target=lambda: outcomes.append(
+                active_runner.run(prompt, self.options(**option_overrides))
+            )
+        )
+        thread.start()
+        self.addCleanup(thread.join, 30)
+        deadline = time.monotonic() + POLL_SECONDS
+        while not pids_with_cwd(self.workdir) and time.monotonic() < deadline:
+            time.sleep(POLL_INTERVAL)
+        self.assertTrue(pids_with_cwd(self.workdir), "the Claude process did not start")
+        return thread, outcomes
+
+    def test_terminate_all_stops_in_flight_runs(self) -> None:
+        """terminate_all kills the live process group, counts it, and the run returns."""
+        thread, outcomes = self.start_in_background(
+            self.runner, "FAKE_SLEEP 30", timeout_seconds=60
+        )
+        self.assertEqual(self.runner.terminate_all(), 1)
+        thread.join(15)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcomes[0].status, STATUS_ERROR)
+        self.assert_no_leftover_processes()
+
+    def test_terminate_all_kills_children_that_ignore_sigterm(self) -> None:
+        """terminate_all falls back to SIGKILL for groups that ignore SIGTERM."""
+        stubborn = make_executable(
+            self.root / "stubborn.sh", "#!/bin/bash\ntrap '' TERM\nsleep 60 &\nwait\n"
+        )
+        stubborn_runner = ClaudeRunner(lambda: stubborn, clock=self.clock, base_env=self.env)
+        with mock.patch.object(runner, "KILL_GRACE_SECONDS", 1):
+            thread, _ = self.start_in_background(stubborn_runner, "hi", timeout_seconds=60)
+            self.assertEqual(stubborn_runner.terminate_all(), 1)
+        thread.join(15)
+        self.assertFalse(thread.is_alive())
+        self.assert_no_leftover_processes()
+
+    def test_terminate_all_with_nothing_running_returns_zero(self) -> None:
+        """An idle runner, or one whose runs have all finished, has nothing to terminate."""
+        self.assertEqual(self.runner.terminate_all(), 0)
+        self.runner.run("hi", self.options())
+        self.assertEqual(self.runner.terminate_all(), 0)
+
+    def test_finished_runs_are_unregistered_even_after_timeout(self) -> None:
+        """A timed-out run leaves no entry behind, so terminate_all won't signal a dead group."""
+        self.runner.run("FAKE_SLEEP 30", self.options(timeout_seconds=1))
+        self.assertEqual(self.runner.terminate_all(), 0)
+
+    def test_child_does_not_receive_telegram_variables(self) -> None:
+        """TELEGRAM_BOT_TOKEN in the parent environment is invisible to the Claude process."""
+        marker_file = self.root / "env.txt"
+        script = make_executable(
+            self.root / "printenv.sh",
+            f"#!/bin/bash\nenv | grep -c '^TELEGRAM_' > '{marker_file}'\n"
+            'echo \'{"type": "result", "subtype": "success", "result": "ok"}\'\n',
+        )
+        guarded = ClaudeRunner(
+            lambda: script,
+            clock=self.clock,
+            base_env={**self.env, "TELEGRAM_BOT_TOKEN": "123456:secret"},
+        )
+        self.assertEqual(guarded.run("hi", self.options()).status, STATUS_SUCCESS)
+        self.assertEqual(marker_file.read_text(encoding="utf-8").strip(), "0")
 
 
 class FakeClaudeInfoCommandTests(unittest.TestCase):

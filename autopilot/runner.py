@@ -16,7 +16,9 @@ Where it fits: ``autopilot.engine`` calls ``ClaudeRunner.run`` (it satisfies the
 
 Invariants:
     * The subscription login is used: ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN
-      never reach the child process.
+      never reach the child process. Neither do TELEGRAM_* variables (the bot token).
+    * Every Claude process group this module starts is tracked while it runs, so
+      ``ClaudeRunner.terminate_all`` can stop them on shutdown.
     * Rate-limit detection never runs on a successful result, so a task that merely
       talks about "usage limits" is never mistaken for one.
     * All datetimes are timezone-aware; "now" comes from an injected clock.
@@ -31,9 +33,10 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime, time as day_time, timedelta
+from datetime import UTC, date, datetime, time as day_time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +49,7 @@ from autopilot.models import (
     RunOptions,
     RunOutcome,
 )
+from autopilot.schedule import MONTH_NAMES, WEEKDAY_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,9 @@ KEEP_CLAUDE_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR")
 # Set by a parent Claude Code session; passing it down would confuse the child.
 PARENT_SESSION_ENV = "CLAUDECODE"
 CLAUDE_ENV_PREFIX = "CLAUDE_"
+# Variables with these prefixes never reach Claude: a prompt-injected task could read the
+# Telegram bot token from its environment and leak it.
+STRIPPED_ENV_PREFIXES = ("TELEGRAM_",)
 
 # Seconds between SIGTERM and SIGKILL when a run exceeds its timeout.
 KILL_GRACE_SECONDS = 10
@@ -89,11 +96,17 @@ RATE_LIMIT_RE = re.compile(
 )
 # Matches the machine-readable reset time "...limit reached|1760000000" (epoch seconds).
 RESET_EPOCH_RE = re.compile(r"\|(\d{10})\b")
-# Matches a human reset time such as "resets 5pm", "resets at 5:30 pm", "reset 17:00".
+# Matches a human reset time such as "resets 5pm", "resets at 5:30 pm", "reset 17:00",
+# optionally preceded by a month and day ("resets Nov 7, 9am", "resets Nov 7 at 9:30am")
+# or by a weekday ("resets Thu 9am"), as weekly-limit messages are worded.
 RESET_CLOCK_RE = re.compile(
-    r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?",
+    r"resets?\s+"
+    rf"(?:(?P<month>{'|'.join(MONTH_NAMES)})[a-z]*\.?\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?,?\s+"
+    rf"|(?P<weekday>{'|'.join(WEEKDAY_NAMES)})[a-z]*\.?,?\s+)?"
+    r"(?:at\s+)?(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>[ap]\.?m\.?)?",
     re.IGNORECASE,
 )
+DAYS_IN_WEEK = 7
 HTTP_TOO_MANY_REQUESTS = 429
 MAX_HOUR_24 = 23
 MAX_MINUTE = 59
@@ -182,7 +195,15 @@ def find_claude_binary(
         >>> binary = find_claude_binary()  # doctest: +SKIP
     """
     if configured:
-        configured_path = Path(configured).expanduser()
+        try:
+            configured_path = Path(configured).expanduser()
+        except RuntimeError as err:
+            # "~nosuchuser/claude": the home folder of that user can't be determined.
+            raise ClaudeNotFoundError(
+                f"CLAUDE_BIN points to '{configured}', whose home folder can't be "
+                f"resolved ({err}). "
+                "Fix the path in .env or remove CLAUDE_BIN to search automatically."
+            ) from err
         if not _is_executable_file(configured_path):
             raise ClaudeNotFoundError(
                 f"CLAUDE_BIN points to '{configured}', which is not an executable file. "
@@ -272,8 +293,9 @@ def build_command(
 def child_environment(base: Mapping[str, str]) -> dict[str, str]:
     """Build the environment for the Claude child process.
 
-    Removes API credentials (so the subscription login is used) and everything a
-    parent Claude Code session exported, except the variables Claude needs to log in.
+    Removes API credentials (so the subscription login is used), every TELEGRAM_*
+    variable (the bot token must not be readable by a prompted tool call) and everything
+    a parent Claude Code session exported, except the variables Claude needs to log in.
 
     Args:
         base: The environment to start from, usually ``os.environ``.
@@ -284,6 +306,8 @@ def child_environment(base: Mapping[str, str]) -> dict[str, str]:
     environment: dict[str, str] = {}
     for key, value in base.items():
         if key in STRIP_ENV or key == PARENT_SESSION_ENV:
+            continue
+        if key.startswith(STRIPPED_ENV_PREFIXES):
             continue
         if key.startswith(CLAUDE_ENV_PREFIX) and key not in KEEP_CLAUDE_ENV:
             continue
@@ -308,20 +332,18 @@ def _require_aware(moment: datetime) -> datetime:
     return moment
 
 
-def _next_wall_time(match: re.Match[str], now: datetime) -> datetime | None:
-    """Turn a "resets 5pm" match into the next such wall-clock moment after ``now``.
+def _time_of_day(match: re.Match[str]) -> day_time | None:
+    """Read the hour, minute and optional am/pm of a reset-time match.
 
     Args:
         match: A match of RESET_CLOCK_RE.
-        now: Current time, aware; its tzinfo defines the wall clock.
 
     Returns:
-        The next occurrence of that time of day strictly after ``now`` (today or
-        tomorrow), or None when the numbers are not a valid time of day.
+        The time of day, or None when the numbers are not valid (e.g. "13pm", "25:00").
     """
-    hour = int(match.group(1))
-    minute = int(match.group(2) or 0)
-    meridiem = (match.group(3) or "").lower()
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or 0)
+    meridiem = (match.group("meridiem") or "").lower()
     if meridiem:
         # 12-hour clock: 12am is midnight, 12pm is noon.
         if not 1 <= hour <= MAX_HOUR_12:
@@ -331,13 +353,61 @@ def _next_wall_time(match: re.Match[str], now: datetime) -> datetime | None:
             hour += HOURS_PER_HALF_DAY
     if hour > MAX_HOUR_24 or minute > MAX_MINUTE:
         return None
-    candidate = datetime.combine(now.date(), day_time(hour, minute), tzinfo=now.tzinfo)
+    return day_time(hour, minute)
+
+
+def _candidate_days(match: re.Match[str], now: datetime) -> list[date]:
+    """List, soonest first, the calendar days a reset-time match could refer to.
+
+    Args:
+        match: A match of RESET_CLOCK_RE.
+        now: Current time, aware; its tzinfo defines which calendar day "today" is.
+
+    Returns:
+        The named month-day (this year and next), the next matching weekdays (today
+        included), or just today and tomorrow when the text names no date.
+    """
+    today = now.date()
+    if match.group("month"):
+        month = MONTH_NAMES.index(match.group("month").lower()) + 1
+        day = int(match.group("day"))
+        days = []
+        for year in (today.year, today.year + 1):
+            try:
+                days.append(date(year, month, day))
+            except ValueError:
+                # Impossible date such as "Feb 30", or Feb 29 in a non-leap year.
+                continue
+        return days
+    if match.group("weekday"):
+        weekday = WEEKDAY_NAMES.index(match.group("weekday").lower())
+        week = [today + timedelta(days=offset) for offset in range(DAYS_IN_WEEK + 1)]
+        return [day for day in week if day.weekday() == weekday]
+    return [today, today + timedelta(days=1)]
+
+
+def _next_wall_time(match: re.Match[str], now: datetime) -> datetime | None:
+    """Turn a "resets 5pm" style match into the next such wall-clock moment after ``now``.
+
+    Args:
+        match: A match of RESET_CLOCK_RE.
+        now: Current time, aware; its tzinfo defines the wall clock.
+
+    Returns:
+        The first moment strictly after ``now`` that has the named time of day (on the
+        named date or weekday, when there is one), or None when the numbers or the
+        date are not valid.
+    """
+    time_of_day = _time_of_day(match)
+    if time_of_day is None:
+        return None
     # Compare as real instants: aware datetimes sharing a tzinfo compare by wall time only.
-    if candidate.astimezone(UTC) <= now.astimezone(UTC):
-        candidate = datetime.combine(
-            now.date() + timedelta(days=1), day_time(hour, minute), tzinfo=now.tzinfo
-        )
-    return candidate
+    now_utc = now.astimezone(UTC)
+    for day in _candidate_days(match, now):
+        candidate = datetime.combine(day, time_of_day, tzinfo=now.tzinfo)
+        if candidate.astimezone(UTC) > now_utc:
+            return candidate
+    return None
 
 
 def _parse_reset_time(text: str, now: datetime) -> datetime | None:
@@ -575,6 +645,7 @@ def _signal_group(process_group_id: int, signal_number: signal.Signals) -> None:
     try:
         os.killpg(process_group_id, signal_number)
     except ProcessLookupError:
+        # The group already exited (normally, or killed a moment ago): nothing left to signal.
         pass
 
 
@@ -614,6 +685,36 @@ def _describe_timeout(seconds: int) -> str:
     return f"{seconds} seconds"
 
 
+def _start_process(
+    command: list[str], options: RunOptions, environment: Mapping[str, str]
+) -> subprocess.Popen[str]:
+    """Start the Claude CLI with piped stdin, stdout and stderr in a new session.
+
+    Args:
+        command: The argv from ``build_command``.
+        options: Per-run settings; the process starts in ``options.workdir``.
+        environment: The child's environment, from ``child_environment``.
+
+    Returns:
+        The running process. It leads its own process group, so the whole tree can be killed.
+
+    Raises:
+        OSError: If the process can't start (missing folder, unusable binary).
+    """
+    return subprocess.Popen(
+        command,
+        cwd=options.workdir,
+        env=dict(environment),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+
+
 class ClaudeRunner:
     """Runs prompts through the Claude CLI; implements the ``models.Runner`` protocol.
 
@@ -641,6 +742,9 @@ class ClaudeRunner:
         self._resolve_binary = resolve_binary
         self._clock = clock
         self._base_env = base_env
+        # Live children by pid, so terminate_all can find them from another thread.
+        self._live: dict[int, subprocess.Popen[str]] = {}
+        self._lock = threading.Lock()
 
     def run(
         self, prompt: str, options: RunOptions, resume_session: str | None = None
@@ -648,8 +752,7 @@ class ClaudeRunner:
         """Run one prompt to completion and report what happened.
 
         Never raises for problems with Claude itself (missing binary, start failure,
-        timeout, bad output): those become outcomes. Only KeyboardInterrupt and
-        other unexpected exceptions propagate, after the process group is killed.
+        timeout, bad output): those become outcomes.
 
         Args:
             prompt: Text written to the CLI's stdin.
@@ -658,6 +761,10 @@ class ClaudeRunner:
 
         Returns:
             The RunOutcome; status ``timeout`` after ``options.timeout_seconds``.
+
+        Raises:
+            BaseException: Whatever interrupted the wait (KeyboardInterrupt, SystemExit or a
+                bug) is re-raised unchanged, after the process group has been killed.
         """
         try:
             binary = self._resolve_binary()
@@ -669,37 +776,76 @@ class ClaudeRunner:
         logger.debug("Starting Claude in %s: %s", options.workdir, command)
         started = time.monotonic()
         try:
-            # A new session makes the child a group leader, so the whole tree can be killed.
-            process = subprocess.Popen(
-                command,
-                cwd=options.workdir,
-                env=environment,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                start_new_session=True,
-            )
+            process = _start_process(command, options, environment)
         except OSError as err:
             return RunOutcome(status=STATUS_ERROR, error=f"Could not start the Claude CLI: {err}")
+        return self._supervise(process, prompt, options, started)
 
-        with process:
+    def terminate_all(self) -> int:
+        """Stop every Claude process group this runner has started and not yet seen finish.
+
+        Used on shutdown so Ctrl-C or SIGTERM doesn't leave Claude running. Sends SIGTERM
+        to each group, waits up to KILL_GRACE_SECONDS in total, then SIGKILLs the groups.
+        The ``run`` calls waiting on those processes return normally (as failed runs).
+
+        Returns:
+            The number of process groups signalled; 0 when nothing was running.
+
+        Side effects:
+            Blocks up to KILL_GRACE_SECONDS.
+        """
+        with self._lock:
+            live = list(self._live.values())
+        for process in live:
+            _signal_group(process.pid, signal.SIGTERM)
+        deadline = time.monotonic() + KILL_GRACE_SECONDS
+        for process in live:
             try:
-                stdout, stderr = process.communicate(prompt, timeout=options.timeout_seconds)
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                _kill_process_group(process)
-                return RunOutcome(
-                    status=STATUS_TIMEOUT,
-                    error=f"Timed out after {_describe_timeout(options.timeout_seconds)}.",
-                    duration_ms=self._elapsed_ms(started),
-                )
-            except BaseException:
-                # Includes KeyboardInterrupt: never leave a Claude tree running behind us.
-                _kill_process_group(process)
-                raise
+                logger.warning("Claude (pid %s) ignored SIGTERM; sending SIGKILL", process.pid)
+        # Always SIGKILL: a leader that exited may have left children that ignore SIGTERM.
+        for process in live:
+            _signal_group(process.pid, signal.SIGKILL)
+        return len(live)
 
+    def _supervise(
+        self, process: subprocess.Popen[str], prompt: str, options: RunOptions, started: float
+    ) -> RunOutcome:
+        """Feed the prompt to a started process, wait for it and build the outcome.
+
+        Args:
+            process: The running child (its own session and process group).
+            prompt: Text written to its stdin.
+            options: Per-run settings; ``timeout_seconds`` bounds the wait.
+            started: ``time.monotonic()`` reading from just before the start.
+
+        Returns:
+            The parsed outcome, or a ``timeout`` outcome after killing the group.
+
+        Raises:
+            BaseException: Any other interruption, re-raised after the group is killed.
+        """
+        with self._lock:
+            self._live[process.pid] = process
+        try:
+            with process:
+                try:
+                    stdout, stderr = process.communicate(prompt, timeout=options.timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    _kill_process_group(process)
+                    return RunOutcome(
+                        status=STATUS_TIMEOUT,
+                        error=f"Timed out after {_describe_timeout(options.timeout_seconds)}.",
+                        duration_ms=self._elapsed_ms(started),
+                    )
+                except BaseException:
+                    # Includes KeyboardInterrupt: never leave a Claude tree running behind us.
+                    _kill_process_group(process)
+                    raise
+        finally:
+            with self._lock:
+                self._live.pop(process.pid, None)
         return parse_output(
             stdout, stderr, process.returncode, self._elapsed_ms(started), self._clock()
         )
