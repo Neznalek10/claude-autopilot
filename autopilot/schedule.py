@@ -56,6 +56,8 @@ SAT_AND_SUN = frozenset({5, 6})
 
 MINUTES_PER_HOUR = 60
 HOURS_PER_DAY = 24
+LAST_MINUTE = MINUTES_PER_HOUR - 1
+LAST_HOUR = HOURS_PER_DAY - 1
 CRON_FIELD_COUNT = 5
 
 # Cron shorthand names and the 5-field expression each one stands for.
@@ -106,8 +108,8 @@ class _FieldSpec:
     names: dict[str, int]
 
 
-_MINUTE_FIELD = _FieldSpec("minute", 0, 59, {})
-_HOUR_FIELD = _FieldSpec("hour", 0, 23, {})
+_MINUTE_FIELD = _FieldSpec("minute", 0, LAST_MINUTE, {})
+_HOUR_FIELD = _FieldSpec("hour", 0, LAST_HOUR, {})
 _DAY_OF_MONTH_FIELD = _FieldSpec("day-of-month", 1, 31, {})
 _MONTH_FIELD = _FieldSpec("month", 1, 12, {name: i + 1 for i, name in enumerate(MONTH_NAMES)})
 # Cron weekday numbering: sun = 0, mon = 1 ... sat = 6; 7 is accepted as Sunday too.
@@ -220,10 +222,19 @@ class Schedule:
         Returns:
             The fire time, or None when no time on ``day`` qualifies.
         """
+        is_first_day = day == after.date()
         for hour in sorted(self.hours):
+            # On the day of ``after`` nothing earlier than its wall-clock hour
+            # and minute can qualify, so skip those without building datetimes.
+            if is_first_day and hour < after.hour:
+                continue
             for minute in sorted(self.minutes):
+                if is_first_day and (hour, minute) < (after.hour, after.minute):
+                    continue
                 # fold=0 (the default) picks the first pass of an ambiguous time.
                 candidate = datetime(day.year, day.month, day.day, hour, minute, tzinfo=after.tzinfo)
+                # The UTC comparison stays: it also rejects first-pass times that
+                # lie before a second-pass ``after`` during a fall-back hour.
                 if candidate.astimezone(timezone.utc) <= after_utc:
                     continue
                 if _wall_time_exists(candidate):
@@ -443,8 +454,10 @@ def _parse_clock(text: str) -> tuple[int, int]:
     if not match:
         raise _InvalidSchedule(f"time '{text}' must look like HH:MM, for example 07:30")
     hour, minute = int(match.group(1)), int(match.group(2))
-    if hour > 23 or minute > 59:
-        raise _InvalidSchedule(f"time '{text}' is out of range (hour 0-23, minute 00-59)")
+    if hour > LAST_HOUR or minute > LAST_MINUTE:
+        raise _InvalidSchedule(
+            f"time '{text}' is out of range (hour 0-{LAST_HOUR}, minute 00-{LAST_MINUTE})"
+        )
     return hour, minute
 
 
@@ -555,27 +568,42 @@ def _parse_cron(expression: str, cron_text: str) -> Schedule:
 
 
 def _describe_cron(schedule: Schedule) -> str:
-    """Describe a cron schedule in words when it is simple, else show the cron text.
+    """Describe a cron schedule in words when it has a common shape, else show the cron text.
+
+    Common shapes (all need every month):
+        * minute 0 of every hour, every day: "hourly";
+        * one minute, one hour, any day of month: "daily at HH:MM", "weekdays at
+          HH:MM", "weekends at HH:MM" or "Mon, Wed at HH:MM" (by weekday set);
+        * one minute, one hour, one day of month, any weekday: "monthly on day D at HH:MM".
 
     Args:
         schedule: A schedule parsed from cron fields.
 
     Returns:
-        "daily at HH:MM" or "weekdays at HH:MM" for one minute, one hour, any
-        day of month, every month and all days or Mon-Fri; otherwise
-        "cron: <expression>".
+        The words, or "cron: <expression>" for any other shape.
     """
-    is_once_a_day = (
-        len(schedule.minutes) == 1
-        and len(schedule.hours) == 1
+    fallback = f"cron: {schedule.expression}"
+    if schedule.months != ALL_MONTHS:
+        return fallback
+    if (
+        schedule.minutes == frozenset({0})
+        and schedule.hours == ALL_HOURS
         and schedule.day_of_month_any
-        and schedule.months == ALL_MONTHS
-    )
-    if is_once_a_day and schedule.weekdays in (ALL_WEEKDAYS, MON_TO_FRI):
-        (hour,) = schedule.hours
-        (minute,) = schedule.minutes
+        and schedule.weekdays == ALL_WEEKDAYS
+    ):
+        return "hourly"
+    if len(schedule.minutes) != 1 or len(schedule.hours) != 1:
+        return fallback
+    (hour,) = schedule.hours
+    (minute,) = schedule.minutes
+    if schedule.day_of_month_any:
         return _describe_daily(schedule.weekdays, hour, minute)
-    return f"cron: {schedule.expression}"
+    if len(schedule.days_of_month) == 1 and schedule.weekday_any:
+        # With a restricted weekday too, cron's OR rule applies, so only
+        # a "*" weekday field means "just that day of the month".
+        (day,) = schedule.days_of_month
+        return f"monthly on day {day} at {hour:02d}:{minute:02d}"
+    return fallback
 
 
 def _parse_field(text: str, spec: _FieldSpec) -> frozenset[int]:

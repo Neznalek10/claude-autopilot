@@ -11,7 +11,7 @@ All times are fixed and aware (TZ from helpers.py); nothing reads the real clock
 from __future__ import annotations
 
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 
 from autopilot.errors import ConfigError, ScheduleError
 from autopilot.schedule import (
@@ -27,6 +27,27 @@ UTC = timezone.utc
 # 2026-03-29 02:00 -> 03:00 in Prague (spring forward); 2026-10-25 03:00 -> 02:00 (fall back).
 SPRING_FORWARD_DAY = date(2026, 3, 29)
 FALL_BACK_DAY = date(2026, 10, 25)
+
+
+class CountingZone(tzinfo):
+    """A UTC time zone that counts offset lookups, a stand-in for "work done"."""
+
+    def __init__(self) -> None:
+        """Start with zero recorded lookups."""
+        self.calls = 0
+
+    def utcoffset(self, moment: datetime | None) -> timedelta:
+        """Count the lookup and return a zero offset."""
+        self.calls += 1
+        return timedelta(0)
+
+    def dst(self, moment: datetime | None) -> timedelta:
+        """Return no daylight saving offset."""
+        return timedelta(0)
+
+    def tzname(self, moment: datetime | None) -> str:
+        """Return the zone name."""
+        return "COUNT"
 
 
 def at(year: int, month: int, day: int, hour: int = 0, minute: int = 0, fold: int = 0) -> datetime:
@@ -208,8 +229,10 @@ class AliasTests(unittest.TestCase):
 
     def test_alias_descriptions(self) -> None:
         self.assertEqual(parse_schedule("@daily").description, "daily at 00:00")
-        self.assertEqual(parse_schedule("@hourly").description, "cron: @hourly")
-        self.assertEqual(parse_schedule("@monthly").description, "cron: @monthly")
+        self.assertEqual(parse_schedule("@midnight").description, "daily at 00:00")
+        self.assertEqual(parse_schedule("@hourly").description, "hourly")
+        self.assertEqual(parse_schedule("@weekly").description, "Sun at 00:00")
+        self.assertEqual(parse_schedule("@monthly").description, "monthly on day 1 at 00:00")
 
 
 class FriendlyFormTests(unittest.TestCase):
@@ -300,6 +323,10 @@ class FriendlyFormTests(unittest.TestCase):
         self.assertEqual(schedule.days_of_month, frozenset(range(1, 32)))
         self.assertTrue(schedule.day_of_month_any)
 
+    def test_clock_boundaries_are_accepted(self) -> None:
+        self.assertEqual(parse_schedule("daily 00:00").description, "daily at 00:00")
+        self.assertEqual(parse_schedule("daily 23:59").description, "daily at 23:59")
+
     def test_bad_clock_times_are_rejected(self) -> None:
         for text in ("daily 24:00", "daily 07:60", "daily 7", "daily 7:5", "daily 07:30:00",
                      "daily noon", "weekdays 123:00"):
@@ -341,9 +368,31 @@ class CronDescriptionTests(unittest.TestCase):
         self.assertEqual(parse_schedule("30 7 * * 1-5").description, "weekdays at 07:30")
         self.assertEqual(parse_schedule("0 8 * * mon-fri").description, "weekdays at 08:00")
 
+    def test_minute_zero_of_every_hour_is_hourly(self) -> None:
+        self.assertEqual(parse_schedule("0 * * * *").description, "hourly")
+        self.assertEqual(parse_schedule("0 0-23 * * *").description, "hourly")
+
+    def test_one_time_with_weekday_list_names_the_days(self) -> None:
+        self.assertEqual(parse_schedule("0 18 * * mon,wed").description, "Mon, Wed at 18:00")
+        self.assertEqual(parse_schedule("15 9 * * 1,3,5").description, "Mon, Wed, Fri at 09:15")
+        self.assertEqual(parse_schedule("0 8 * * 0,6").description, "weekends at 08:00")
+        self.assertEqual(parse_schedule("0 19 * * 7").description, "Sun at 19:00")
+
+    def test_one_time_on_one_day_of_month_is_monthly(self) -> None:
+        self.assertEqual(parse_schedule("0 9 1 * *").description, "monthly on day 1 at 09:00")
+        self.assertEqual(parse_schedule("5 14 15 * *").description, "monthly on day 15 at 14:05")
+
     def test_everything_else_shows_the_cron_text(self) -> None:
-        for expression in ("*/5 * * * *", "0 8,17 * * *", "0 8 * * 0,6", "0 8 1 * *",
-                           "0 8 * 6 *", "0 8 * * mon,wed"):
+        for expression in (
+            "*/5 * * * *",
+            "30 * * * *",
+            "0 8,17 * * *",
+            "0,30 8 * * *",
+            "0 8 1,15 * *",
+            "0 8 * 6 *",
+            "0 8 1 6 *",
+            "0 9 13 * fri",  # day-of-month and weekday both set: cron OR rule
+        ):
             with self.subTest(expression=expression):
                 self.assertEqual(parse_schedule(expression).description, f"cron: {expression}")
 
@@ -414,6 +463,17 @@ class NextAfterTests(unittest.TestCase):
         in_utc = schedule.next_after(datetime(2026, 11, 2, 12, 0, tzinfo=UTC))
         self.assertEqual(in_utc, datetime(2026, 11, 3, 7, 30, tzinfo=UTC))
         self.assertEqual(in_utc.utcoffset(), timedelta(0))
+
+    def test_search_does_not_rebuild_earlier_times_of_the_first_day(self) -> None:
+        # Late in the day, a dense schedule must go straight to the next slot
+        # instead of walking every minute since 00:00 (about 1400 datetimes).
+        zone = CountingZone()
+        after = datetime(2026, 11, 2, 23, 57, tzinfo=zone)
+        self.assertEqual(
+            parse_schedule("* * * * *").next_after(after),
+            datetime(2026, 11, 2, 23, 58, tzinfo=zone),
+        )
+        self.assertLess(zone.calls, 20)
 
     def test_naive_datetime_raises_value_error(self) -> None:
         with self.assertRaises(ValueError):
