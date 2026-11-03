@@ -10,4 +10,4 @@ this file imports nothing so that importing the package stays cheap.
 """
 
 # Single source of truth for the version: pyproject.toml reads this attribute.
-__version__ = "0.1.0"
+__version__ = "1.0.0"
