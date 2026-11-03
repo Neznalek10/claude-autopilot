@@ -9,9 +9,8 @@
 #   Tasks read web pages, and a page can contain hidden instructions. So by default
 #   every task runs in the empty "workspace" folder, away from your files and from
 #   the .env file that holds your Telegram bot token. On top of that, Claude is
-#   always blocked from reading .env files, ~/.ssh, ~/.aws, ~/.gnupg,
-#   ~/.claude/.credentials.json and ~/.config/gws, whatever you put in
-#   allowed_tools. Only point a task at another workdir when it needs those files,
+#   always blocked from reading credential files such as .env files, SSH and
+#   cloud keys and login tokens, whatever you put in allowed_tools. Only point a task at another workdir when it needs those files,
 #   and then do not give it web tools (WebSearch, WebFetch).
 #
 # Structure:

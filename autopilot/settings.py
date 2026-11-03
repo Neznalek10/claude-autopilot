@@ -159,20 +159,25 @@ def _parse_log_level(raw: str | None) -> str:
 
 
 def _parse_chat_id(raw: str | None) -> int | None:
-    """Parse TELEGRAM_CHAT_ID, an integer that may be negative (group chats).
+    """Parse TELEGRAM_CHAT_ID, the owner's positive Telegram user id.
 
     Raises:
-        ConfigError: If the value is not an integer.
+        ConfigError: If the value is not a positive integer (group chats have
+            negative ids and are not supported).
     """
     if raw is None:
         return None
     try:
-        return int(raw.strip())
+        chat_id = int(raw.strip())
     except ValueError:
+        chat_id = 0
+    if chat_id <= 0:
         raise ConfigError(
-            f"TELEGRAM_CHAT_ID must be an integer such as 123456789 (negative for groups), got '{raw}'. "
+            f"TELEGRAM_CHAT_ID must be your own Telegram user id, a positive whole number such as "
+            f"123456789, got '{raw}'. Group chats are not supported. "
             "Run `autopilot telegram-setup` to set it."
-        ) from None
+        )
+    return chat_id
 
 
 def load_settings(

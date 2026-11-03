@@ -9,6 +9,7 @@ from __future__ import annotations
 import stat
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -173,6 +174,24 @@ class SandboxTest(TaskConfigTestCase):
         path.write_text('[[task]]\nname = "a"\nprompt = "p"\n', encoding="utf-8")
         config = load_task_config(path, protected_paths=[self.base / ".env"])
         self.assertIn(f"Read(/{self.base / '.env'})", config.tasks["a"].options.disallowed_tools)
+
+    def test_extra_credential_rules_present(self) -> None:
+        """Common credential files beyond .env are always denied."""
+        options = self.parse({"task": [self.task()]}).tasks["news"].options
+        for rule in ("Read(~/.claude.json)", "Read(~/.netrc)", "Read(~/.git-credentials)",
+                     "Read(~/.config/gh/**)", "Read(~/.config/gcloud/**)", "Read(~/.kube/**)",
+                     "Read(~/.docker/config.json)", "Read(~/.npmrc)", "Read(~/.pypirc)", "Read(**/.envrc)"):
+            self.assertIn(rule, options.disallowed_tools)
+
+    def test_workspace_that_is_a_file_is_config_error(self) -> None:
+        """A file named 'workspace' gives a ConfigError naming the path."""
+        (self.base / "workspace").write_text("x", encoding="utf-8")
+        self.assertConfigError({"task": [self.task()]}, str(self.base / "workspace"), "not a folder")
+
+    def test_workspace_that_cannot_be_created_is_config_error(self) -> None:
+        """A mkdir failure (read-only folder) becomes a ConfigError naming the path."""
+        with mock.patch.object(Path, "mkdir", side_effect=PermissionError(13, "Permission denied")):
+            self.assertConfigError({"task": [self.task()]}, str(self.base / "workspace"), "cannot create")
 
     def test_model_cannot_start_with_dash(self) -> None:
         """A model like --help would become a CLI flag, so it is rejected."""

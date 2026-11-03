@@ -73,13 +73,13 @@ class LoadSettingsTest(unittest.TestCase):
         self.assertTrue((project_root() / "autopilot").is_dir())
 
     def test_telegram_values(self) -> None:
-        """Token and a negative chat id enable Telegram."""
+        """Token and a positive chat id enable Telegram."""
         settings = self.load({
             "AUTOPILOT_TIMEZONE": "UTC",
             "TELEGRAM_BOT_TOKEN": "tok",
-            "TELEGRAM_CHAT_ID": "-100123",
+            "TELEGRAM_CHAT_ID": "123456789",
         })
-        self.assertEqual(settings.telegram_chat_id, -100123)
+        self.assertEqual(settings.telegram_chat_id, 123456789)
         self.assertTrue(settings.telegram_enabled)
 
     def test_token_without_chat_is_not_enabled(self) -> None:
@@ -144,6 +144,15 @@ class LoadSettingsTest(unittest.TestCase):
                 with self.assertRaises(ConfigError) as ctx:
                     load_settings({variable: "~nosuchuser_zz/x", "AUTOPILOT_TIMEZONE": "UTC"}, home=None if variable == "AUTOPILOT_HOME" else self.home)
                 self.assertIn(variable, str(ctx.exception))
+
+    def test_group_and_zero_chat_ids_are_rejected(self) -> None:
+        """Negative (group) and zero chat ids fail, saying groups are not supported."""
+        for value in ("-100123", "0"):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError) as ctx:
+                    self.load({"AUTOPILOT_TIMEZONE": "UTC", "TELEGRAM_CHAT_ID": value})
+                self.assertIn("TELEGRAM_CHAT_ID", str(ctx.exception))
+                self.assertIn("Group chats are not supported", str(ctx.exception))
 
     def test_token_never_in_error(self) -> None:
         """A bad chat id error must not echo the bot token."""

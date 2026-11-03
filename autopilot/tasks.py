@@ -67,6 +67,16 @@ PROTECTED_READ_RULES = (
     "Read(~/.gnupg/**)",
     "Read(~/.claude/.credentials.json)",
     "Read(~/.config/gws/**)",
+    "Read(~/.claude.json)",
+    "Read(~/.netrc)",
+    "Read(~/.git-credentials)",
+    "Read(~/.config/gh/**)",
+    "Read(~/.config/gcloud/**)",
+    "Read(~/.kube/**)",
+    "Read(~/.docker/config.json)",
+    "Read(~/.npmrc)",
+    "Read(~/.pypirc)",
+    "Read(**/.envrc)",
 )
 
 DEFAULT_ALLOWED_TOOLS = ("Read", "Glob", "Grep", "WebSearch", "WebFetch")
@@ -205,11 +215,26 @@ def _default_workdir(base_dir: Path) -> Path:
 
     Tasks without a ``workdir`` run here, in an empty folder, rather than in the project
     folder that holds ``.env`` and the bot token.
+
+    Raises:
+        ConfigError: If the path exists but is not a folder, or cannot be created.
     """
     workspace = base_dir.resolve() / WORKSPACE_DIR_NAME
-    if not workspace.exists():
+    if workspace.exists():
+        if not workspace.is_dir():
+            raise ConfigError(
+                f"tasks.toml: the default workdir {workspace} exists but is not a folder. "
+                "Rename or remove it, or set 'workdir' explicitly."
+            )
+        return workspace
+    try:
         workspace.mkdir(mode=WORKSPACE_DIR_MODE, parents=True, exist_ok=True)
         workspace.chmod(WORKSPACE_DIR_MODE)
+    except OSError as err:
+        raise ConfigError(
+            f"tasks.toml: cannot create the default workdir {workspace}: {err.strerror or err}. "
+            "Make the folder writable or set 'workdir' explicitly."
+        ) from err
     return workspace
 
 
