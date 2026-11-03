@@ -177,7 +177,8 @@ class Store:
         """
         self._db_path = db_path
         if not db_path.parent.exists():
-            db_path.parent.mkdir(mode=PRIVATE_DIR_MODE, parents=True)
+            # exist_ok: another autopilot process may create it between the check and here.
+            db_path.parent.mkdir(mode=PRIVATE_DIR_MODE, parents=True, exist_ok=True)
             # mkdir's mode is filtered by the umask. A folder the user chose and
             # that already exists keeps its own permissions.
             db_path.parent.chmod(PRIVATE_DIR_MODE)

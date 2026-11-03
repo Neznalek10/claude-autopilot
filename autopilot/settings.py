@@ -175,7 +175,7 @@ def _parse_chat_id(raw: str | None) -> int | None:
         raise ConfigError(
             f"TELEGRAM_CHAT_ID must be your own Telegram user id, a positive whole number such as "
             f"123456789, got '{raw}'. Group chats are not supported. "
-            "Run `autopilot telegram-setup` to set it."
+            "Delete the TELEGRAM_CHAT_ID line from .env, then run `autopilot telegram-setup`."
         )
     return chat_id
 
