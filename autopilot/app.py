@@ -255,9 +255,10 @@ def build_app(
         store=store,
         runner=runner,
         notifier=notifier,
-        # .env holds the bot token and the database holds the chat history: Claude must not read either.
+        # .env holds the bot token; the data folder holds the chat history (database,
+        # its -wal and -shm files) and the log. Claude must not read any of them.
         config_loader=lambda: load_task_config(
-            settings.tasks_file, protected_paths=(settings.env_file, settings.db_path)
+            settings.tasks_file, protected_paths=(settings.env_file, settings.data_dir / "**")
         ),
         clock=now,
         tasks_file=settings.tasks_file,

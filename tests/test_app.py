@@ -189,7 +189,7 @@ class BuildAppTests(AppTestCase):
         app = build_app(settings)
         self.assertIn(rule, app.engine.config.tasks["news"].options.disallowed_tools)
         self.assertIn(rule, app.engine.config.ask_options.disallowed_tools)
-        self.assertIn(f"Read(/{settings.db_path})", app.engine.config.ask_options.disallowed_tools)
+        self.assertIn(f"Read(/{settings.data_dir / '**'})", app.engine.config.ask_options.disallowed_tools)
 
     def test_with_telegram_builds_notifier_and_bot(self) -> None:
         """Telegram settings: a notifier with the local zone, plus the bot."""

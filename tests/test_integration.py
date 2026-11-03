@@ -512,7 +512,7 @@ class AC3RunTests(IntegrationCase):
         for rule in PROTECTED_READ_RULES:
             self.assertIn(rule, denied)
         self.assertIn(f"Read(/{self.home / '.env'})", denied)
-        self.assertIn(f"Read(/{self.home / 'data' / 'autopilot.db'})", denied)
+        self.assertIn(f"Read(/{self.home / 'data' / '**'})", denied)
         workspace = self.home / "workspace"
         self.assertEqual(call["cwd"], str(workspace))
         self.assertEqual(stat.S_IMODE(workspace.stat().st_mode), 0o700)
