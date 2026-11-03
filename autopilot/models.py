@@ -71,6 +71,27 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # Never prompts, so an unattended run can't hang waiting for an answer.
 DEFAULT_PERMISSION_MODE = "dontAsk"
 
+# Default run timeout when tasks.toml sets none: 30 minutes.
+DEFAULT_TIMEOUT_SECONDS = 1800
+
+# A chat conversation idle for this many hours starts fresh with the next message.
+CHAT_IDLE_HOURS = 6
+
+# Telegram bot commands with their one-line help texts. bot.py registers them
+# with Telegram and formatting.py lists them in the /help text, so both read
+# this single copy.
+BOT_COMMANDS = (
+    ("tasks", "List tasks and next runs"),
+    ("run", "Run a task now: /run <task>"),
+    ("ask", "Chat with Claude: /ask <text> (or just type)"),
+    ("new", "Start a new conversation: /new [text]"),
+    ("last", "Latest result: /last [task]"),
+    ("status", "What is running and queued"),
+    ("pause", "Pause a task's schedule"),
+    ("resume", "Resume a task's schedule"),
+    ("help", "How to use this bot"),
+)
+
 
 @dataclass(frozen=True)
 class RunOptions:
@@ -98,7 +119,7 @@ class RunOptions:
     add_dirs: tuple[Path, ...] = ()
     append_system_prompt: str | None = None
     max_budget_usd: float | None = None
-    timeout_seconds: int = 1800
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True)

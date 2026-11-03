@@ -1046,6 +1046,7 @@ class AC13ServiceTests(IntegrationCase):
         calls: list[tuple[str, ...]] = []
 
         def fake_systemctl(args: Any, timeout: float = 20.0) -> tuple[int, str, str]:
+            """Record the systemctl/loginctl call and report success with linger on."""
             calls.append(tuple(args))
             return 0, "Linger=yes\n", ""
 
@@ -1080,6 +1081,7 @@ class AC14SecretsTests(IntegrationCase):
         saved_handlers, saved_level = list(root.handlers), root.level
 
         def restore() -> None:
+            """Remove handlers the test added and put the root log level back."""
             for handler in list(root.handlers):
                 if handler not in saved_handlers:
                     root.removeHandler(handler)
@@ -1101,6 +1103,7 @@ class AC14SecretsTests(IntegrationCase):
         """A failed Bot API call raises an error without the token or request URL."""
 
         def unreachable(*_args: Any, **_kwargs: Any) -> Any:
+            """Stand in for urlopen when DNS fails, so no request leaves the machine."""
             raise urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
 
         client = TelegramClient(TOKEN, urlopen=unreachable)

@@ -42,7 +42,6 @@ from autopilot.models import (
     TRIGGER_TELEGRAM,
     TRIGGERS,
     RunOptions,
-    RunRecord,
     Task,
 )
 from helpers import (
