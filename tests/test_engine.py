@@ -1042,6 +1042,26 @@ class ChatTests(EngineTestCase):
         self.assertEqual(self.run_now(retry_id).status, STATUS_SUCCESS)
         self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "new")
 
+    def test_retried_turn_from_before_new_runs_fresh_and_cannot_break_the_new_chat(self) -> None:
+        """A pre-/new retry neither resumes the new conversation nor clears it when it fails."""
+        turn_a = self.engine.enqueue_prompt("A", dispatch=False)
+        self.clock.advance(seconds=1)
+        self.engine.reset_chat()
+        self.clock.advance(seconds=1)
+        turn_b = self.engine.enqueue_prompt("B", dispatch=False)
+        self.runner.queue(
+            success(session_id="new"),
+            RunOutcome(status=STATUS_RATE_LIMITED, error="limit", retry_at=self.clock() + timedelta(minutes=10)),
+            RunOutcome(status=STATUS_ERROR, error="boom"),
+        )
+        self.run_now(turn_b)
+        self.run_now(turn_a)
+        self.clock.advance(minutes=11)
+        (retry_id,) = self.engine.tick()
+        self.assertEqual(self.run_now(retry_id).status, STATUS_ERROR)
+        self.assertIsNone(self.runner.calls[-1].resume_session)
+        self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "new")
+
     def test_turn_queued_after_new_stores_its_session(self) -> None:
         """Only turns queued at or before the reset are affected; later ones store normally."""
         self.engine.reset_chat()

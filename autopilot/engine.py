@@ -644,7 +644,10 @@ class Engine:
             logger.info("Run #%d deferred until the usage limit resets", record.id)
             return finished
         is_chat = record.trigger == TRIGGER_CHAT
-        resume_session = self._chat_session(now) if is_chat else None
+        # A turn queued before the latest /new (or retried from one) belongs to the
+        # old conversation: it runs fresh, so it can neither continue nor break the new one.
+        is_stale_chat = is_chat and self._was_chat_reset_since(self._first_queued_at(record))
+        resume_session = self._chat_session(now) if is_chat and not is_stale_chat else None
         self._store.mark_running(record.id, now)
         outcome = self._call_runner(record, options, resume_session)
         finished_at = self._clock()
