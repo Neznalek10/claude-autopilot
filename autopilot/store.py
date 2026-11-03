@@ -39,6 +39,10 @@ from autopilot.models import (
 logger = logging.getLogger(__name__)
 
 BUSY_TIMEOUT_SECONDS = 10
+# Prompts, results and chat history can be personal, so the data folder and
+# the database stay readable by the owner only, whatever the umask says.
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
 INTERRUPTED_MESSAGE = "Interrupted: autopilot stopped before this run finished."
 DENIED_TOOLS_SEPARATOR = ","
 
@@ -165,13 +169,21 @@ class Store:
 
         Raises:
             sqlite3.Error: If the file cannot be opened or is not a database.
+            OSError: If the folder or file permissions cannot be set.
+
+        Side effects:
+            Sets the data folder to mode 0o700 and the database file to 0o600.
         """
         self._db_path = db_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.parent.mkdir(mode=PRIVATE_DIR_MODE, parents=True, exist_ok=True)
+        # mkdir's mode is filtered by the umask and skipped for an existing folder.
+        db_path.parent.chmod(PRIVATE_DIR_MODE)
         with self._connect() as conn:
             # WAL lets readers and one writer work at once; the mode is stored in the file.
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+        # SQLite creates the file with the umask; its -wal and -shm files copy this mode.
+        db_path.chmod(PRIVATE_FILE_MODE)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
