@@ -893,6 +893,41 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.runner.run("hi", self.options())
         self.assertEqual(self.runner.terminate_all(), 0)
 
+    def test_run_after_terminate_all_refuses_to_start(self) -> None:
+        """Once terminate_all has run, run() starts nothing and says Autopilot is stopping."""
+        self.runner.terminate_all()
+        outcome = self.runner.run("hi", self.options())
+        self.assertEqual(outcome.status, STATUS_ERROR)
+        self.assertEqual(outcome.error, "Autopilot is stopping, so this run was not started.")
+        self.assertFalse(self.log.exists())
+
+    def test_start_racing_with_terminate_all_is_not_left_running(self) -> None:
+        """A start that begins while terminate_all holds the lock waits, then is refused."""
+        entered_start = threading.Event()
+        real_start = runner._start_process
+
+        def slow_start(*args, **kwargs):
+            """Start a process after signalling that the launch lock is held."""
+            entered_start.set()
+            time.sleep(0.3)
+            return real_start(*args, **kwargs)
+
+        outcomes = []
+        with mock.patch.object(runner, "_start_process", side_effect=slow_start):
+            starter = threading.Thread(
+                target=lambda: outcomes.append(
+                    self.runner.run("FAKE_SLEEP 30", self.options(timeout_seconds=60))
+                )
+            )
+            starter.start()
+            self.addCleanup(starter.join, 30)
+            self.assertTrue(entered_start.wait(POLL_SECONDS))
+            # The launch holds the lock, so this snapshot waits for it and then sees the child.
+            self.assertEqual(self.runner.terminate_all(), 1)
+        starter.join(15)
+        self.assertFalse(starter.is_alive())
+        self.assert_no_leftover_processes()
+
     def test_finished_runs_are_unregistered_even_after_timeout(self) -> None:
         """A timed-out run leaves no entry behind, so terminate_all won't signal a dead group."""
         self.runner.run("FAKE_SLEEP 30", self.options(timeout_seconds=1))

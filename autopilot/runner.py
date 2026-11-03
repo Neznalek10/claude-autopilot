@@ -82,6 +82,7 @@ EXTENSION_GLOB = "anthropic.claude-code-*"
 EXTENSION_BINARY_RELATIVE_PATH = Path("resources/native-binary/claude")
 # Pulls "2.1.314" out of "anthropic.claude-code-2.1.314-linux-x64".
 EXTENSION_VERSION_RE = re.compile(r"claude-code-(\d+(?:\.\d+)*)")
+FIX_CLAUDE_BIN_HINT = "Fix the path in .env or remove CLAUDE_BIN to search automatically."
 INSTALL_HINT = (
     "Fix: install it with `claude install` from any working copy, "
     "or set CLAUDE_BIN in .env to the full path of the claude binary."
@@ -121,6 +122,7 @@ SUBTYPE_MESSAGES = {
     "error_during_execution": "Claude Code failed during execution.",
     "error_max_budget_usd": "Stopped: reached this task's max_budget_usd.",
 }
+STOPPING_MESSAGE = "Autopilot is stopping, so this run was not started."
 UNREADABLE_OUTPUT_MESSAGE = "Claude CLI returned output autopilot couldn't read"
 
 
@@ -165,6 +167,69 @@ def _extension_binaries(extensions_dir: Path) -> list[Path]:
     return [folder / EXTENSION_BINARY_RELATIVE_PATH for folder in folders]
 
 
+def _configured_binary(configured: str) -> Path:
+    """Validate the explicit CLAUDE_BIN path.
+
+    Args:
+        configured: The value of CLAUDE_BIN; ``~`` is expanded.
+
+    Returns:
+        The path of the executable file.
+
+    Raises:
+        ClaudeNotFoundError: If ``~user`` can't be expanded or the file isn't executable.
+    """
+    try:
+        path = Path(configured).expanduser()
+    except RuntimeError as err:
+        # "~nosuchuser/claude": the home folder of that user can't be determined.
+        raise ClaudeNotFoundError(
+            f"CLAUDE_BIN points to '{configured}', whose home folder can't be "
+            f"resolved ({err}). {FIX_CLAUDE_BIN_HINT}"
+        ) from err
+    if not _is_executable_file(path):
+        raise ClaudeNotFoundError(
+            f"CLAUDE_BIN points to '{configured}', which is not an executable file. "
+            f"{FIX_CLAUDE_BIN_HINT}"
+        )
+    return path
+
+
+def _home_candidates(home_dir: Path) -> list[Path]:
+    """List the binaries to try under the home folder, in priority order.
+
+    Args:
+        home_dir: The home folder to search.
+
+    Returns:
+        ``~/.local/bin/claude``, ``~/.claude/local/claude``, then the VS Code and
+        VS Code Server extension binaries (newest version first). Not yet checked
+        for being executable.
+    """
+    candidates = [home_dir / relative for relative in LOCAL_BINARY_RELATIVE_PATHS]
+    for extensions_dir in VSCODE_EXTENSION_DIRS:
+        candidates.extend(_extension_binaries(home_dir / extensions_dir))
+    return candidates
+
+
+def _checked_places(home_dir: Path) -> list[str]:
+    """Describe every place find_claude_binary looks, for the not-found message.
+
+    Args:
+        home_dir: The home folder that was searched.
+
+    Returns:
+        Human-readable places: PATH, the fixed home locations and the extension patterns.
+    """
+    places = ["claude on PATH"]
+    places.extend(str(home_dir / relative) for relative in LOCAL_BINARY_RELATIVE_PATHS)
+    places.extend(
+        str(home_dir / extensions_dir / EXTENSION_GLOB / EXTENSION_BINARY_RELATIVE_PATH)
+        for extensions_dir in VSCODE_EXTENSION_DIRS
+    )
+    return places
+
+
 def find_claude_binary(
     configured: str | None = None,
     *,
@@ -194,45 +259,19 @@ def find_claude_binary(
         >>> binary = find_claude_binary()  # doctest: +SKIP
     """
     if configured:
-        try:
-            configured_path = Path(configured).expanduser()
-        except RuntimeError as err:
-            # "~nosuchuser/claude": the home folder of that user can't be determined.
-            raise ClaudeNotFoundError(
-                f"CLAUDE_BIN points to '{configured}', whose home folder can't be "
-                f"resolved ({err}). "
-                "Fix the path in .env or remove CLAUDE_BIN to search automatically."
-            ) from err
-        if not _is_executable_file(configured_path):
-            raise ClaudeNotFoundError(
-                f"CLAUDE_BIN points to '{configured}', which is not an executable file. "
-                "Fix the path in .env or remove CLAUDE_BIN to search automatically."
-            )
-        return configured_path
+        return _configured_binary(configured)
 
     home_dir = Path.home() if home is None else home
-    checked: list[str] = []
-
     # PATH comes first so a user's own install wins over bundled copies.
     on_path = which("claude")
-    checked.append("claude on PATH")
     if on_path and _is_executable_file(Path(on_path)):
         return Path(on_path)
-
-    candidates = [home_dir / relative for relative in LOCAL_BINARY_RELATIVE_PATHS]
-    for extensions_dir in VSCODE_EXTENSION_DIRS:
-        candidates.extend(_extension_binaries(home_dir / extensions_dir))
-    for candidate in candidates:
+    for candidate in _home_candidates(home_dir):
         if _is_executable_file(candidate):
             return candidate
-
-    checked.extend(str(home_dir / relative) for relative in LOCAL_BINARY_RELATIVE_PATHS)
-    checked.extend(
-        str(home_dir / extensions_dir / EXTENSION_GLOB / EXTENSION_BINARY_RELATIVE_PATH)
-        for extensions_dir in VSCODE_EXTENSION_DIRS
-    )
     raise ClaudeNotFoundError(
-        f"Claude Code CLI not found. Checked: {', '.join(checked)}. {INSTALL_HINT}"
+        f"Claude Code CLI not found. Checked: {', '.join(_checked_places(home_dir))}. "
+        f"{INSTALL_HINT}"
     )
 
 
@@ -743,6 +782,9 @@ class ClaudeRunner:
         self._base_env = base_env
         # Live children by pid, so terminate_all can find them from another thread.
         self._live: dict[int, subprocess.Popen[str]] = {}
+        # Set by terminate_all; once true no new process starts. Guarded by _lock together
+        # with _live, so a start can't slip in between terminate_all's snapshot and its kills.
+        self._stopping = False
         self._lock = threading.Lock()
 
     def run(
@@ -750,8 +792,10 @@ class ClaudeRunner:
     ) -> RunOutcome:
         """Run one prompt to completion and report what happened.
 
-        Never raises for problems with Claude itself (missing binary, start failure,
-        timeout, bad output): those become outcomes.
+        Problems with Claude itself (missing binary, start failure, timeout, bad output,
+        a runner that is shutting down) become outcomes, not exceptions. Only
+        KeyboardInterrupt and other unexpected exceptions propagate, after the process
+        group has been killed.
 
         Args:
             prompt: Text written to the CLI's stdin.
@@ -762,8 +806,9 @@ class ClaudeRunner:
             The RunOutcome; status ``timeout`` after ``options.timeout_seconds``.
 
         Raises:
-            BaseException: Whatever interrupted the wait (KeyboardInterrupt, SystemExit or a
-                bug) is re-raised unchanged, after the process group has been killed.
+            BaseException: KeyboardInterrupt, SystemExit or any other unexpected exception
+                raised while waiting is re-raised unchanged, after the process group
+                has been killed.
         """
         try:
             binary = self._resolve_binary()
@@ -775,9 +820,11 @@ class ClaudeRunner:
         logger.debug("Starting Claude in %s: %s", options.workdir, command)
         started = time.monotonic()
         try:
-            process = _start_process(command, options, environment)
+            process = self._launch(command, options, environment)
         except OSError as err:
             return RunOutcome(status=STATUS_ERROR, error=f"Could not start the Claude CLI: {err}")
+        if process is None:
+            return RunOutcome(status=STATUS_ERROR, error=STOPPING_MESSAGE)
         return self._supervise(process, prompt, options, started)
 
     def terminate_all(self) -> int:
@@ -786,6 +833,7 @@ class ClaudeRunner:
         Used on shutdown so Ctrl-C or SIGTERM doesn't leave Claude running. Sends SIGTERM
         to each group, waits up to KILL_GRACE_SECONDS in total, then SIGKILLs the groups.
         The ``run`` calls waiting on those processes return normally (as failed runs).
+        After this call, ``run`` refuses to start anything new (STOPPING_MESSAGE).
 
         Returns:
             The number of process groups signalled; 0 when nothing was running.
@@ -794,6 +842,7 @@ class ClaudeRunner:
             Blocks up to KILL_GRACE_SECONDS.
         """
         with self._lock:
+            self._stopping = True
             live = list(self._live.values())
         for process in live:
             _signal_group(process.pid, signal.SIGTERM)
@@ -808,13 +857,40 @@ class ClaudeRunner:
             _signal_group(process.pid, signal.SIGKILL)
         return len(live)
 
+    def _launch(
+        self, command: list[str], options: RunOptions, environment: Mapping[str, str]
+    ) -> subprocess.Popen[str] | None:
+        """Start the process and register its group, unless the runner is shutting down.
+
+        Starting and registering happen under one lock, so every started process is
+        visible to ``terminate_all`` and nothing starts after it ran.
+
+        Args:
+            command: The argv from ``build_command``.
+            options: Per-run settings.
+            environment: The child's environment.
+
+        Returns:
+            The running process, or None when ``terminate_all`` has been called.
+
+        Raises:
+            OSError: If the process can't start.
+        """
+        with self._lock:
+            if self._stopping:
+                return None
+            process = _start_process(command, options, environment)
+            self._live[process.pid] = process
+        return process
+
     def _supervise(
         self, process: subprocess.Popen[str], prompt: str, options: RunOptions, started: float
     ) -> RunOutcome:
-        """Feed the prompt to a started process, wait for it and build the outcome.
+        """Feed the prompt to a launched process, wait for it and build the outcome.
 
         Args:
-            process: The running child (its own session and process group).
+            process: The running child (its own session and process group), already
+                registered by ``_launch``; it is unregistered here when it finishes.
             prompt: Text written to its stdin.
             options: Per-run settings; ``timeout_seconds`` bounds the wait.
             started: ``time.monotonic()`` reading from just before the start.
@@ -825,8 +901,6 @@ class ClaudeRunner:
         Raises:
             BaseException: Any other interruption, re-raised after the group is killed.
         """
-        with self._lock:
-            self._live[process.pid] = process
         try:
             with process:
                 try:
