@@ -28,6 +28,8 @@ from html import unescape
 
 from autopilot.models import (
     ASK_TASK_NAME,
+    BOT_COMMANDS,
+    CHAT_IDLE_HOURS,
     STATUS_SUCCESS,
     STATUS_TIMEOUT,
     TRIGGER_CHAT,
@@ -67,6 +69,13 @@ BLOCKED_TOOLS_CHARS = 400
 UPCOMING_RUNS_SHOWN = 3
 QUEUED_TITLES_SHOWN = 5
 RECENT_DAYS = 6
+# Separators added around a result chunk in a message: after the header, before the
+# attachment note and before the blocked-tools notice.
+RESERVED_SEPARATORS = 3
+
+MS_PER_SECOND = 1000
+SECONDS_PER_MINUTE = 60
+MINUTES_PER_HOUR = 60
 
 EMPTY_RESULT_HTML = "<i>(no text output)</i>"
 ATTACHED_NOTE = "<i>Full result attached as a file.</i>"
@@ -78,20 +87,6 @@ NO_TASKS_HINT = (
 WEEKDAY_ABBREVIATIONS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 DOCUMENT_TIME_FORMAT = "%Y%m%d-%H%M"
 METADATA_TIME_FORMAT = "%Y-%m-%d %H:%M"
-
-# The bot's commands with one-line help texts. bot.BOT_COMMANDS holds the same
-# list; this copy keeps formatting.py free of imports from bot.py.
-HELP_COMMANDS = (
-    ("tasks", "List tasks and next runs"),
-    ("run", "Run a task now: /run <task>"),
-    ("ask", "Chat with Claude: /ask <text> (or just type)"),
-    ("new", "Start a new conversation: /new [text]"),
-    ("last", "Latest result: /last [task]"),
-    ("status", "What is running and queued"),
-    ("pause", "Pause a task's schedule"),
-    ("resume", "Resume a task's schedule"),
-    ("help", "How to use this bot"),
-)
 
 # --- Markdown block and line patterns (applied to HTML-escaped text) -------------------
 
@@ -265,15 +260,15 @@ def format_duration(ms: int | None) -> str:
     if ms is None:
         return "?"
     ms = max(ms, 0)
-    if ms < 1000:
+    if ms < MS_PER_SECOND:
         return f"{ms} ms"
-    seconds = ms // 1000
-    if seconds < 60:
+    seconds = ms // MS_PER_SECOND
+    if seconds < SECONDS_PER_MINUTE:
         return f"{seconds}s"
-    minutes, seconds = divmod(seconds, 60)
-    if minutes < 60:
+    minutes, seconds = divmod(seconds, SECONDS_PER_MINUTE)
+    if minutes < MINUTES_PER_HOUR:
         return f"{minutes}m {seconds:02d}s"
-    hours, minutes = divmod(minutes, 60)
+    hours, minutes = divmod(minutes, MINUTES_PER_HOUR)
     return f"{hours}h {minutes:02d}m"
 
 
@@ -377,8 +372,12 @@ def format_run_messages(
     is_plain_answer = record.status == STATUS_SUCCESS and record.trigger == TRIGGER_CHAT
     header = "" if is_plain_answer else run_header(record)
     notice = _blocked_tools_notice(record.denied_tools)
-    # Reserve room for everything added around a chunk so the sum stays under the cap.
-    reserved = len(header) + len(notice) + len(ATTACHED_NOTE) + 3 * len(BLOCK_SEPARATOR)
+    # Reserve room for everything added around a chunk so the sum stays under the cap:
+    # the header, the attachment note, the blocked-tools notice and their separators.
+    reserved = (
+        len(header) + len(notice) + len(ATTACHED_NOTE)
+        + RESERVED_SEPARATORS * len(BLOCK_SEPARATOR)
+    )
     chunks = split_for_telegram(
         record.result, min(CHUNK_CHARS, TELEGRAM_MAX_CHARS - reserved)
     ) or [EMPTY_RESULT_HTML]
@@ -433,8 +432,8 @@ def format_task_list(
     """Build the /tasks reply: one block per task.
 
     Each block reads ``<b>name</b> · <schedules>`` (or "manual only"), with
-    "⏸ paused" or "off" appended where they apply, then a line
-    ``next <time> · last <icon> <time>``. The next time is omitted when the
+    "⏸ paused" or "off" appended where they apply, then the task's description
+    when it has one, then a line ``next <time> · last <icon> <time>``. The next time is omitted when the
     task has none.
 
     Args:
@@ -457,12 +456,17 @@ def format_task_list(
             title += " · off"
         if paused.get(task.name):
             title += " · ⏸ paused"
+        # The task's own description (from tasks.toml) sits under the name line.
         details = []
         next_time = next_times.get(task.name)
         if next_time is not None:
             details.append(f"next {format_time(next_time, now)}")
         details.append(_last_run_text(last_runs.get(task.name), now))
-        blocks.append(f"{title}\n{' · '.join(details)}")
+        lines = [title]
+        if task.description:
+            lines.append(escape_html(task.description))
+        lines.append(" · ".join(details))
+        blocks.append("\n".join(lines))
     return BLOCK_SEPARATOR.join(blocks)
 
 
@@ -509,17 +513,18 @@ def help_text() -> str:
 
     Returns:
         HTML explaining plain-text chat (conversation continues, /new starts
-        fresh, resets after 6 quiet hours) and listing every command.
+        fresh, resets after ``CHAT_IDLE_HOURS`` quiet hours) and listing every command.
     """
+    unit = "hour" if CHAT_IDLE_HOURS == 1 else "hours"
     lines = [
         "<b>Claude Autopilot</b>",
         "Just type a message to chat with Claude. The conversation continues "
         "from message to message; /new starts a fresh one, and it starts fresh "
-        "by itself after 6 quiet hours.",
+        f"by itself after {CHAT_IDLE_HOURS} quiet {unit}.",
         "",
         "<b>Commands</b>",
     ]
-    lines.extend(f"/{name} · {escape_html(text)}" for name, text in HELP_COMMANDS)
+    lines.extend(f"/{name} · {escape_html(text)}" for name, text in BOT_COMMANDS)
     return "\n".join(lines)
 
 

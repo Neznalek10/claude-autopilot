@@ -14,13 +14,13 @@ from __future__ import annotations
 import random
 import re
 import unittest
+from unittest import mock
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from autopilot.formatting import (
     ATTACHED_NOTE,
     CHUNK_CHARS,
-    HELP_COMMANDS,
     STATUS_ICONS,
     TELEGRAM_MAX_CHARS,
     escape_html,
@@ -37,7 +37,7 @@ from autopilot.formatting import (
     run_title,
     split_for_telegram,
 )
-from autopilot.models import QueueSnapshot
+from autopilot.models import BOT_COMMANDS, CHAT_IDLE_HOURS, QueueSnapshot
 from helpers import TZ, make_record, make_task
 
 ALLOWED_TAGS = {"b", "i", "s", "code", "pre", "a"}
@@ -681,6 +681,15 @@ class TaskListTests(unittest.TestCase):
         )
         assert_valid_telegram_html(self, text)
 
+    def test_task_description_is_shown_escaped_under_the_name(self) -> None:
+        """A non-empty description is its own escaped line before the next/last line."""
+        task = make_task("news", schedules=(StubSchedule("hourly"),), description="Digest <AI> & more")
+        text = format_task_list([task], {}, {}, {}, NOW)
+        self.assertEqual(
+            text, "<b>news</b> · hourly\nDigest &lt;AI&gt; &amp; more\nlast never"
+        )
+        assert_valid_telegram_html(self, text)
+
     def test_manual_paused_and_disabled_markers(self) -> None:
         """Manual-only, paused and off tasks are labelled; never-run tasks say so."""
         manual = make_task("manual")
@@ -764,20 +773,26 @@ class HelpTests(unittest.TestCase):
         """Every command appears, the chat explanation is present, HTML is valid."""
         text = help_text()
         assert_valid_telegram_html(self, text)
-        for name, _ in HELP_COMMANDS:
+        for name, _ in BOT_COMMANDS:
             self.assertIn(f"/{name} ·", text)
         self.assertIn("/run · Run a task now: /run &lt;task&gt;", text)
         self.assertIn("Just type", text)
         self.assertIn("/new", text)
-        self.assertIn("6 quiet hours", text)
+        self.assertIn(f"{CHAT_IDLE_HOURS} quiet hours", text)
         self.assertLess(len(text), TELEGRAM_MAX_CHARS)
 
-    def test_command_list_matches_the_planned_commands(self) -> None:
-        """The command names are exactly the ones the bot registers."""
-        names = [name for name, _ in HELP_COMMANDS]
-        self.assertEqual(
-            names, ["tasks", "run", "ask", "new", "last", "status", "pause", "resume", "help"]
-        )
+    def test_idle_hours_come_from_the_shared_constant(self) -> None:
+        """The reset time in the help text follows models.CHAT_IDLE_HOURS."""
+        with mock.patch("autopilot.formatting.CHAT_IDLE_HOURS", 9):
+            self.assertIn("after 9 quiet hours", help_text())
+        with mock.patch("autopilot.formatting.CHAT_IDLE_HOURS", 1):
+            self.assertIn("after 1 quiet hour.", help_text())
+
+    def test_commands_come_from_the_shared_list(self) -> None:
+        """A command added to models.BOT_COMMANDS shows up in the help text."""
+        extra = (*BOT_COMMANDS, ("zap", "Do <zap>"))
+        with mock.patch("autopilot.formatting.BOT_COMMANDS", extra):
+            self.assertIn("/zap · Do &lt;zap&gt;", help_text())
 
 
 if __name__ == "__main__":
