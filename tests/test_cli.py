@@ -139,6 +139,21 @@ class ParserTests(CliTestCase):
         for name in SUBCOMMANDS:
             self.assertIn(name, out)
 
+    def test_debug_flag_accepted_after_the_subcommand(self) -> None:
+        """--debug works before and after the subcommand, with the same effect."""
+        for argv in (("--debug", "validate"), ("validate", "--debug")):
+            with self.subTest(argv=argv):
+                code, _, err = self.run_cli(*argv)
+                self.assertEqual(code, 1)
+                self.assertIn("Traceback", err)
+
+    def test_debug_flag_after_a_command_with_arguments(self) -> None:
+        """`run <task> --debug` parses and keeps the other arguments."""
+        args = cli.build_parser().parse_args(["run", "news", "--debug"])
+        self.assertTrue(cli._debug_requested(args))
+        self.assertEqual(args.task, "news")
+        self.assertFalse(cli._debug_requested(cli.build_parser().parse_args(["run", "news"])))
+
     def test_non_positive_count_is_usage_error(self) -> None:
         """-n 0 is rejected by argparse with exit 2."""
         code, _, err = self.run_cli("next", "daily 07:30", "-n", "0")

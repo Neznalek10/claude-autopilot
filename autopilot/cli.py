@@ -34,7 +34,7 @@ from autopilot import __version__
 from autopilot.app import App, build_app, configure_logging, init_project, run_service, telegram_setup
 from autopilot.doctor import format_report, run_doctor
 from autopilot.errors import AutopilotError, TaskNotFoundError
-from autopilot.formatting import STATUS_ICONS, format_duration, format_time
+from autopilot.formatting import METADATA_TIME_FORMAT, STATUS_ICONS, format_duration, format_time
 from autopilot.models import (
     ASK_TASK_NAME,
     STATUS_SUCCESS,
@@ -65,7 +65,6 @@ NO_VALUE = "-"
 QUIET_LOG_LEVEL = "WARNING"
 UNKNOWN_ICON = "?"
 SHOW_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-NEXT_TIME_FORMAT = "%Y-%m-%d %H:%M"
 
 # A handler gets the parsed arguments and the settings and returns the exit code.
 Handler = Callable[[argparse.Namespace, Settings], int]
@@ -89,6 +88,8 @@ class _UnusedRunner:
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with every subcommand.
 
+    ``--debug`` is accepted before or after the subcommand.
+
     Returns:
         The parser; ``parse_args`` sets ``args.handler`` to the command function.
 
@@ -96,102 +97,121 @@ def build_parser() -> argparse.ArgumentParser:
         >>> build_parser().parse_args(["next", "daily 07:30"]).expression
         'daily 07:30'
     """
+    # SUPPRESS keeps a subparser from overwriting a --debug given before the command.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--debug",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="debug logging and full tracebacks on errors",
+    )
     parser = argparse.ArgumentParser(
         prog=PROGRAM,
+        parents=[common],
         description="Run Claude Code prompt tasks on schedules and control them from Telegram.",
         epilog="Example:\n  autopilot init\n  autopilot validate\n  autopilot start",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"{PROGRAM} {__version__}")
-    parser.add_argument(
-        "--debug", action="store_true", help="debug logging and full tracebacks on errors"
-    )
     commands = parser.add_subparsers(dest="command", required=True, metavar="<command>")
+    for add_group in (
+        _add_run_commands,
+        _add_inspect_commands,
+        _add_schedule_commands,
+        _add_setup_commands,
+    ):
+        add_group(commands, common)
+    return parser
 
-    def add(name: str, handler: Handler, summary: str, example: str) -> argparse.ArgumentParser:
-        """Register a subcommand whose --help ends with a usage example."""
-        sub = commands.add_parser(
-            name,
-            help=summary,
-            description=summary,
-            epilog=f"Example:\n  {example}",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-        )
-        sub.set_defaults(handler=handler)
-        return sub
 
-    add("init", _cmd_init, "create tasks.toml and .env from the examples", "autopilot init")
-    add("start", _cmd_start, "run the scheduler and the Telegram bot (blocks)", "autopilot start")
+def _add_command(
+    commands: argparse._SubParsersAction,  # noqa: SLF001 - argparse exposes no public type
+    common: argparse.ArgumentParser,
+    name: str,
+    handler: Handler,
+    summary: str,
+    example: str,
+) -> argparse.ArgumentParser:
+    """Register one subcommand whose --help ends with a usage example."""
+    sub = commands.add_parser(
+        name,
+        parents=[common],
+        help=summary,
+        description=summary,
+        epilog=f"Example:\n  {example}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub.set_defaults(handler=handler)
+    return sub
 
-    run = add("run", _cmd_run, "run one task now and print the result", "autopilot run ai-news")
+
+def _add_run_commands(commands: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:  # noqa: SLF001
+    """Register `init`, `start`, `run` and `ask`."""
+    _add_command(commands, common, "init", _cmd_init,
+                 "create tasks.toml and .env from the examples", "autopilot init")
+    _add_command(commands, common, "start", _cmd_start,
+                 "run the scheduler and the Telegram bot (blocks)", "autopilot start")
+    run = _add_command(commands, common, "run", _cmd_run,
+                       "run one task now and print the result", "autopilot run ai-news --no-notify")
     run.add_argument("task", help="task name from tasks.toml")
     run.add_argument("--no-notify", action="store_true", help="do not send the result to Telegram")
-
-    ask = add(
-        "ask", _cmd_ask, "send a one-off prompt to Claude", 'autopilot ask "Summarize today\'s news"'
-    )
+    ask = _add_command(commands, common, "ask", _cmd_ask,
+                       "send a one-off prompt to Claude", 'autopilot ask "Summarize today\'s news"')
     ask.add_argument("prompt", help="the prompt text")
     ask.add_argument("--no-notify", action="store_true", help="do not send the answer to Telegram")
 
-    add("list", _cmd_list, "show tasks, schedules and next runs", "autopilot list")
 
-    history = add(
-        "history", _cmd_history, "show recent runs", "autopilot history ai-news -n 20"
-    )
+def _add_inspect_commands(commands: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:  # noqa: SLF001
+    """Register `list`, `history` and `show`."""
+    _add_command(commands, common, "list", _cmd_list,
+                 "show tasks, schedules and next runs", "autopilot list")
+    history = _add_command(commands, common, "history", _cmd_history,
+                           "show recent runs", "autopilot history ai-news -n 20")
     history.add_argument("task", nargs="?", help="only runs of this task")
     history.add_argument(
         "-n", dest="limit", type=_positive_int, default=DEFAULT_HISTORY_LIMIT,
         help=f"how many runs to show (default {DEFAULT_HISTORY_LIMIT})",
     )
-
-    show = add("show", _cmd_show, "show one run with its full result", "autopilot show 42")
+    show = _add_command(commands, common, "show", _cmd_show,
+                        "show one run with its full result", "autopilot show 42")
     show.add_argument("run_id", type=int, help="run id from `autopilot history`")
 
-    pause = add("pause", _cmd_pause, "stop a task's schedule", "autopilot pause ai-news")
-    pause.add_argument("task", help="task name from tasks.toml")
-    resume = add("resume", _cmd_resume, "resume a task's schedule", "autopilot resume ai-news")
-    resume.add_argument("task", help="task name from tasks.toml")
 
-    preview = add(
-        "next", _cmd_next, "preview when a schedule fires", 'autopilot next "weekdays 08:00"'
-    )
+def _add_schedule_commands(commands: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:  # noqa: SLF001
+    """Register `pause`, `resume`, `next` and `validate`."""
+    pause = _add_command(commands, common, "pause", _cmd_pause,
+                         "stop a task's schedule", "autopilot pause ai-news")
+    pause.add_argument("task", help="task name from tasks.toml")
+    resume = _add_command(commands, common, "resume", _cmd_resume,
+                          "resume a task's schedule", "autopilot resume ai-news")
+    resume.add_argument("task", help="task name from tasks.toml")
+    preview = _add_command(commands, common, "next", _cmd_next,
+                           "preview when a schedule fires", 'autopilot next "weekdays 08:00"')
     preview.add_argument("expression", help='schedule, e.g. "daily 07:30" or "30 7 * * 1-5"')
     preview.add_argument(
         "-n", dest="count", type=_positive_int, default=DEFAULT_NEXT_COUNT,
         help=f"how many fire times to show (default {DEFAULT_NEXT_COUNT})",
     )
+    _add_command(commands, common, "validate", _cmd_validate,
+                 "check tasks.toml and list its tasks", "autopilot validate")
 
-    add("validate", _cmd_validate, "check tasks.toml and list its tasks", "autopilot validate")
 
-    doctor = add("doctor", _cmd_doctor, "check the whole setup", "autopilot doctor --live")
-    doctor.add_argument(
-        "--live", action="store_true", help="also make one tiny real Claude call"
-    )
-
-    setup = add(
-        "telegram-setup",
-        _cmd_telegram_setup,
-        "connect the Telegram bot and save its token and chat id",
-        "autopilot telegram-setup --wait 300",
-    )
+def _add_setup_commands(commands: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:  # noqa: SLF001
+    """Register `doctor`, `telegram-setup`, `install-service` and `uninstall-service`."""
+    doctor = _add_command(commands, common, "doctor", _cmd_doctor,
+                          "check the whole setup", "autopilot doctor --live")
+    doctor.add_argument("--live", action="store_true", help="also make one tiny real Claude call")
+    setup = _add_command(commands, common, "telegram-setup", _cmd_telegram_setup,
+                         "connect the Telegram bot and save its token and chat id",
+                         "autopilot telegram-setup --wait 300")
     setup.add_argument(
         "--wait", type=_positive_int, default=DEFAULT_SETUP_WAIT_SECONDS,
         help=f"seconds to wait for your first message (default {DEFAULT_SETUP_WAIT_SECONDS})",
     )
-
-    add(
-        "install-service",
-        _cmd_install_service,
-        "install and start the systemd user service",
-        "autopilot install-service",
-    )
-    add(
-        "uninstall-service",
-        _cmd_uninstall_service,
-        "stop and remove the systemd user service",
-        "autopilot uninstall-service",
-    )
-    return parser
+    _add_command(commands, common, "install-service", _cmd_install_service,
+                 "install and start the systemd user service", "autopilot install-service")
+    _add_command(commands, common, "uninstall-service", _cmd_uninstall_service,
+                 "stop and remove the systemd user service", "autopilot uninstall-service")
 
 
 def _positive_int(text: str) -> int:
@@ -230,7 +250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except AutopilotError as err:
         print(f"{PROGRAM}: {err}", file=sys.stderr)
         # Tracebacks are for bug reports, so they are opt-in.
-        if args.debug:
+        if _debug_requested(args):
             traceback.print_exc(file=sys.stderr)
         return EXIT_FAILURE
     except KeyboardInterrupt:
@@ -238,13 +258,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_INTERRUPTED
 
 
+def _debug_requested(args: argparse.Namespace) -> bool:
+    """True when --debug was given (the option is absent from the namespace otherwise)."""
+    return bool(getattr(args, "debug", False))
+
+
 def _configure_cli_logging(settings: Settings, args: argparse.Namespace) -> None:
     """Set up logging: full (file and stderr) for `start`, quiet for everything else."""
     if args.command == "start":
-        configure_logging(settings, debug=args.debug)
+        configure_logging(settings, debug=_debug_requested(args))
         return
     quiet = dataclasses.replace(settings, log_level=QUIET_LOG_LEVEL)
-    configure_logging(quiet, debug=args.debug, to_file=False)
+    configure_logging(quiet, debug=_debug_requested(args), to_file=False)
 
 
 # ---------------------------------------------------------------- helpers
@@ -497,7 +522,7 @@ def _cmd_next(args: argparse.Namespace, settings: Settings) -> int:
     print(f"Schedule: {schedule.description}")
     for _ in range(args.count):
         moment = schedule.next_after(moment)
-        print(f"  {_weekday(moment)} {moment.strftime(NEXT_TIME_FORMAT)}")
+        print(f"  {_weekday(moment)} {moment.strftime(METADATA_TIME_FORMAT)}")
     return EXIT_OK
 
 
