@@ -61,6 +61,16 @@ REDACTED = "***"
 HANDLER_MARKER = "_autopilot_handler"
 
 SETUP_POLL_SECONDS = 25
+DEFAULT_SETUP_WAIT_SECONDS = 120
+# getUpdates returns at most this many updates per call.
+UPDATES_BATCH_LIMIT = 100
+HTTP_CONFLICT = 409
+PRIVATE_CHAT_TYPE = "private"
+CONFIRM_PROMPT = "Use this chat? [y/N] "
+CONFIRM_YES = ("y", "yes")
+DATA_DIR_MODE = 0o700
+LOG_FILE_MODE = 0o600
+PUBLIC_FILE_MODE = 0o644
 TOKEN_PROMPT = "Paste the bot token from @BotFather: "
 SETUP_CONFLICT_MESSAGE = (
     "Another autopilot is polling this bot. Stop it first: systemctl --user stop autopilot"
@@ -131,9 +141,9 @@ def configure_logging(settings: Settings, *, debug: bool = False, to_file: bool 
     """
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     if to_file:
-        settings.log_file.parent.mkdir(parents=True, exist_ok=True)
+        settings.log_file.parent.mkdir(parents=True, exist_ok=True, mode=DATA_DIR_MODE)
         handlers.append(
-            logging.handlers.RotatingFileHandler(
+            _PrivateRotatingFileHandler(
                 settings.log_file,
                 maxBytes=LOG_MAX_BYTES,
                 backupCount=LOG_BACKUP_COUNT,
@@ -154,6 +164,25 @@ def configure_logging(settings: Settings, *, debug: bool = False, to_file: bool 
         handler.addFilter(redactor)
         root.addHandler(handler)
     root.setLevel(logging.DEBUG if debug else settings.log_level)
+
+
+class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Rotating log file that only its owner can read (logs may hold personal data)."""
+
+    def __init__(self, filename: Path, **kwargs: object) -> None:
+        """Open the log file and restrict it to mode 0o600.
+
+        Args:
+            filename: Log file path.
+            **kwargs: Passed to ``RotatingFileHandler``.
+        """
+        super().__init__(filename, **kwargs)  # type: ignore[arg-type]
+        os.chmod(filename, LOG_FILE_MODE)
+
+    def doRollover(self) -> None:
+        """Rotate the files, then restrict the fresh log file again."""
+        super().doRollover()
+        os.chmod(self.baseFilename, LOG_FILE_MODE)
 
 
 @dataclass
@@ -223,7 +252,10 @@ def build_app(
         store=store,
         runner=runner,
         notifier=notifier,
-        config_loader=lambda: load_task_config(settings.tasks_file),
+        # The .env file holds the bot token: Claude must never be allowed to read it.
+        config_loader=lambda: load_task_config(
+            settings.tasks_file, protected_paths=(settings.env_file,)
+        ),
         clock=now,
         tasks_file=settings.tasks_file,
         max_parallel=settings.max_parallel,
@@ -249,6 +281,8 @@ def run_service(app: App, stop: threading.Event) -> None:
         for signum in (signal.SIGTERM, signal.SIGINT):
             previous[signum] = signal.signal(signum, lambda _signum, _frame: stop.set())
     try:
+        # Before the bot thread starts, or fresh runs would be marked interrupted too.
+        app.engine.recover_interrupted()
         _announce_start(app)
         if app.bot is not None:
             threading.Thread(
@@ -275,7 +309,7 @@ def _announce_start(app: App) -> None:
             moment, name = min(upcoming, key=lambda pair: pair[0].timestamp())
             text += f" · next: {name} at {format_time(moment, now)}"
         app.notifier.notify_text(text)
-    except Exception:  # noqa: BLE001 - a failed greeting must not stop the service
+    except Exception:  # A failed greeting must not stop the service, so only log it.
         logger.exception("Could not send the startup notice")
 
 
@@ -283,39 +317,48 @@ def telegram_setup(
     settings: Settings,
     *,
     secret_input: Callable[[str], str] = getpass.getpass,
-    out: TextIO = sys.stdout,
+    out: TextIO | None = None,
     client_factory: Callable[[str], TelegramClient] = TelegramClient,
-    wait_seconds: int = 120,
+    wait_seconds: int = DEFAULT_SETUP_WAIT_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
+    confirm: Callable[[str], str] = input,
 ) -> int:
     """Connect the bot: validate the token, learn the chat id, save both, send a test message.
+
+    Messages that were pending before the setup started are ignored, only
+    private chats are offered, and the user must confirm the chat shown.
 
     Args:
         settings: Provides an existing token, the .env path and the database path.
         secret_input: Prompt for the token without echo.
-        out: Where progress lines are written.
+        out: Where progress lines are written; None means ``sys.stdout`` at call time.
         client_factory: Builds the Telegram client from the token.
-        wait_seconds: How long to wait for the user's first message.
+        wait_seconds: How long to wait for a confirmed chat.
         monotonic: Clock used for the wait deadline.
+        confirm: Asks the yes/no question and returns the answer.
 
     Returns:
         The chat id that was saved.
 
     Raises:
-        AutopilotError: Bad token, no message in time, or another poller holds the bot.
+        AutopilotError: Bad token, no confirmed chat in time, or another poller holds the bot.
         TelegramError: Telegram rejected a call.
     """
+    out = sys.stdout if out is None else out
     token = settings.telegram_token or secret_input(TOKEN_PROMPT).strip()
     client = client_factory(token)
     username = client.get_me().get("username", "")
     # Saved only after getMe accepted it, so a typo never lands in .env.
     set_env_value(settings.env_file, "TELEGRAM_BOT_TOKEN", token)
+
+    # Old messages (possibly from strangers) must not be mistaken for the user's first one.
+    offset = _drain_pending_updates(client)
     out.write(
         f"Open https://t.me/{username} and send any message (waiting up to {wait_seconds} s)...\n"
     )
     out.flush()
 
-    update_id, chat_id = _wait_for_first_message(client, wait_seconds, monotonic)
+    update_id, chat_id = _wait_for_confirmed_chat(client, offset, wait_seconds, monotonic, confirm, out)
     set_env_value(settings.env_file, "TELEGRAM_CHAT_ID", str(chat_id))
     # Skip this message in the service so the bot does not answer it a second time.
     Store(settings.db_path).set_value(OFFSET_KEY, str(update_id + 1))
@@ -324,44 +367,90 @@ def telegram_setup(
     return chat_id
 
 
-def _wait_for_first_message(
-    client: TelegramClient, wait_seconds: int, monotonic: Callable[[], float]
-) -> tuple[int, int]:
-    """Poll until a message arrives.
+def _get_updates(client: TelegramClient, offset: int | None, timeout: int) -> list[dict]:
+    """Call getUpdates, turning a polling conflict (HTTP 409) into a friendly error."""
+    try:
+        return client.get_updates(offset=offset, timeout=timeout)
+    except TelegramError as err:
+        if err.status == HTTP_CONFLICT:
+            raise AutopilotError(SETUP_CONFLICT_MESSAGE) from None
+        raise
+
+
+def _drain_pending_updates(client: TelegramClient) -> int | None:
+    """Read (without waiting) and skip every update already waiting at Telegram.
 
     Args:
         client: Telegram client.
-        wait_seconds: Total time allowed.
-        monotonic: Clock for the deadline.
 
     Returns:
-        ``(update_id, chat_id)`` of the first message.
+        The offset just past the last pending update, or None when none were pending.
+    """
+    offset: int | None = None
+    while True:
+        batch = _get_updates(client, offset, 0)
+        if batch:
+            offset = batch[-1]["update_id"] + 1
+        if len(batch) < UPDATES_BATCH_LIMIT:
+            return offset
+
+
+def _describe_sender(message: dict) -> str:
+    """Return "<first name> (@username), chat id <id>" for a private message (parts may be absent)."""
+    sender = message.get("from") or message.get("chat") or {}
+    parts = [str(sender.get("first_name") or "").strip()]
+    if sender.get("username"):
+        parts.append(f"(@{sender['username']})")
+    label = " ".join(part for part in parts if part)
+    return f"{label}, chat id {message['chat']['id']}" if label else f"chat id {message['chat']['id']}"
+
+
+def _wait_for_confirmed_chat(
+    client: TelegramClient,
+    offset: int | None,
+    wait_seconds: int,
+    monotonic: Callable[[], float],
+    confirm: Callable[[str], str],
+    out: TextIO,
+) -> tuple[int, int]:
+    """Poll new messages until the user confirms a private chat.
+
+    Args:
+        client: Telegram client.
+        offset: First update id to read (past the drained ones).
+        wait_seconds: Total time allowed.
+        monotonic: Clock for the deadline.
+        confirm: Asks the yes/no question.
+        out: Where notes are written.
+
+    Returns:
+        ``(update_id, chat_id)`` of the confirmed message.
 
     Raises:
         AutopilotError: On timeout or when another process polls the same bot (HTTP 409).
     """
     deadline = monotonic() + wait_seconds
-    offset: int | None = None
     while True:
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise AutopilotError(
-                f"No message arrived within {wait_seconds} s. Run `autopilot telegram-setup` "
-                "again and send your bot a message."
+                f"No confirmed chat within {wait_seconds} s. Run `autopilot telegram-setup` "
+                "again, send your bot a message and answer y."
             )
-        try:
-            updates = client.get_updates(
-                offset=offset, timeout=min(SETUP_POLL_SECONDS, max(1, int(remaining)))
-            )
-        except TelegramError as err:
-            if err.status == 409:
-                raise AutopilotError(SETUP_CONFLICT_MESSAGE) from None
-            raise
-        for update in updates:
+        timeout = min(SETUP_POLL_SECONDS, max(1, int(remaining)))
+        for update in _get_updates(client, offset, timeout):
             offset = update["update_id"] + 1
-            chat = (update.get("message") or {}).get("chat") or {}
-            if isinstance(chat.get("id"), int):
+            message = update.get("message") or {}
+            chat = message.get("chat") or {}
+            if not isinstance(chat.get("id"), int):
+                continue
+            if chat.get("type") != PRIVATE_CHAT_TYPE:
+                out.write("Ignored a message from a group or channel: send it in a private chat with the bot.\n")
+                continue
+            out.write(f"Message from {_describe_sender(message)}\n")
+            if confirm(CONFIRM_PROMPT).strip().lower() in CONFIRM_YES:
                 return update["update_id"], chat["id"]
+            out.write("Not saved. Waiting for another message...\n")
 
 
 def init_project(home: Path) -> list[str]:
@@ -385,13 +474,14 @@ def init_project(home: Path) -> list[str]:
         source = project_root() / source_name
         if not source.is_file():
             raise AutopilotError(f"Cannot find {source}. Reinstall autopilot or create {target_name} by hand.")
-        # "x" mode fails instead of overwriting if the file appears meanwhile.
+        # O_EXCL fails instead of overwriting if the file appears meanwhile; the mode is
+        # set at creation so a private file is never readable by others, even briefly.
+        mode = ENV_FILE_MODE if private else PUBLIC_FILE_MODE
         try:
-            with source.open("rb") as reader, open(target, "xb") as writer:
-                shutil.copyfileobj(reader, writer)
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         except FileExistsError:
             continue
-        if private:
-            os.chmod(target, ENV_FILE_MODE)
+        with source.open("rb") as reader, os.fdopen(descriptor, "wb") as writer:
+            shutil.copyfileobj(reader, writer)
         created.append(target_name)
     return created

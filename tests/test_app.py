@@ -111,6 +111,7 @@ class ConfigureLoggingTests(AppTestCase):
         saved_handlers, saved_level = list(root.handlers), root.level
 
         def restore() -> None:
+            """Remove handlers the test added and put the old level back."""
             for handler in list(root.handlers):
                 if handler not in saved_handlers:
                     root.removeHandler(handler)
@@ -131,6 +132,14 @@ class ConfigureLoggingTests(AppTestCase):
         content = settings.log_file.read_text(encoding="utf-8")
         self.assertIn("request failed for ***", content)
         self.assertNotIn(TOKEN, content)
+
+    def test_log_file_and_data_folder_are_private(self) -> None:
+        """The log file is 0600 and a data folder created for it is 0700."""
+        settings = self.make_settings()
+        with contextlib.redirect_stderr(io.StringIO()):
+            configure_logging(settings)
+        self.assertEqual(stat.S_IMODE(settings.log_file.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(settings.data_dir.stat().st_mode), 0o700)
 
     def test_debug_flag_and_level(self) -> None:
         """The configured level applies, and debug=True overrides it."""
@@ -169,6 +178,15 @@ class BuildAppTests(AppTestCase):
         self.assertIsInstance(app.engine._runner, ClaudeRunner)
         self.assertEqual(list(app.engine.config.tasks), ["news"])
         self.assertTrue(settings.db_path.exists())
+
+    def test_env_file_is_protected_from_claude(self) -> None:
+        """Every loaded task denies reading this installation's .env by absolute path."""
+        settings = self.make_settings()
+        self.write_tasks(settings)
+        rule = f"Read(/{settings.env_file})"
+        app = build_app(settings)
+        self.assertIn(rule, app.engine.config.tasks["news"].options.disallowed_tools)
+        self.assertIn(rule, app.engine.config.ask_options.disallowed_tools)
 
     def test_with_telegram_builds_notifier_and_bot(self) -> None:
         """Telegram settings: a notifier with the local zone, plus the bot."""
@@ -254,6 +272,21 @@ class RunServiceTests(AppTestCase):
         text = fake.sent[0]["text"]
         self.assertTrue(text.startswith("🟢 Autopilot is running · 1 tasks · next: news at "), text)
 
+    def test_interrupted_runs_are_recovered_at_start(self) -> None:
+        """A run left queued by a previous process is marked failed when the service starts."""
+        settings = self.make_settings()
+        self.write_tasks(settings)
+        app = build_app(settings)
+        run_id = app.store.create_run(
+            task_name="news", trigger="manual", prompt="x", queued_at=datetime(2026, 11, 2, 7, 0, tzinfo=TZ)
+        )
+        stop = threading.Event()
+        stop.set()
+        self.start_in_thread(app, stop).join(WAIT_SECONDS)
+        record = app.store.get_run(run_id)
+        self.assertEqual(record.status, "error")
+        self.assertIn("Interrupted", record.error)
+
     def test_without_telegram_or_next_run(self) -> None:
         """A manual-only task list works with the log notifier and no 'next' part."""
         settings = self.make_settings()
@@ -273,6 +306,7 @@ class RunServiceTests(AppTestCase):
         app = build_app(settings, client=fake)  # type: ignore[arg-type]
 
         def explode(text: str) -> None:
+            """Fail like a Telegram outage."""
             raise TelegramError("down")
 
         app.notifier.notify_text = explode  # type: ignore[method-assign]
@@ -316,12 +350,23 @@ class TickingClock:
 class TelegramSetupTests(AppTestCase):
     """telegram_setup."""
 
-    def message_update(self, update_id: int, chat_id: int) -> dict:
-        """Build a message update."""
-        return {"update_id": update_id, "message": {"chat": {"id": chat_id}, "text": "hello"}}
+    def message_update(
+        self, update_id: int, chat_id: int, chat_type: str = "private", first_name: str = "Alex"
+    ) -> dict:
+        """Build a message update from a user whose private chat id equals the user id."""
+        return {
+            "update_id": update_id,
+            "message": {
+                "chat": {"id": chat_id, "type": chat_type},
+                "from": {"id": chat_id, "first_name": first_name, "username": "alex_example"},
+                "text": "hello",
+            },
+        }
 
-    def run_setup(self, settings: Settings, fake: FakeTelegramClient, **kwargs: object) -> tuple[int, str]:
-        """Call telegram_setup with injected collaborators; return (chat id, output)."""
+    def run_setup(
+        self, settings: Settings, fake: FakeTelegramClient, **kwargs: object
+    ) -> tuple[int, str]:
+        """Call telegram_setup with injected collaborators (answering "y"); return (chat id, output)."""
         out = io.StringIO()
         defaults: dict[str, object] = {
             "secret_input": lambda prompt: TOKEN,
@@ -329,6 +374,7 @@ class TelegramSetupTests(AppTestCase):
             "client_factory": lambda token: fake,
             "wait_seconds": 120,
             "monotonic": TickingClock(1.0),
+            "confirm": lambda prompt: "y",
         }
         defaults.update(kwargs)
         chat_id = telegram_setup(settings, **defaults)  # type: ignore[arg-type]
@@ -338,7 +384,7 @@ class TelegramSetupTests(AppTestCase):
         """Token and chat id land in a 0600 .env, the offset is stored and a test message is sent."""
         settings = self.make_settings()
         fake = FakeTelegramClient()
-        fake.updates = [[self.message_update(7, 555)]]
+        fake.updates = [[], [self.message_update(7, 555)]]
         chat_id, output = self.run_setup(settings, fake)
         self.assertEqual(chat_id, 555)
         values = dotenv_values(settings.env_file)
@@ -349,25 +395,84 @@ class TelegramSetupTests(AppTestCase):
         self.assertEqual(fake.sent[0]["chat_id"], 555)
         self.assertIn("connected", fake.sent[0]["text"])
         self.assertIn("https://t.me/autopilot_test_bot", output)
+        self.assertIn("Alex (@alex_example), chat id 555", output)
         self.assertNotIn(TOKEN, output)
+
+    def test_stale_pending_update_is_skipped(self) -> None:
+        """A message that was waiting before setup started is never offered or saved."""
+        settings = self.make_settings()
+        fake = FakeTelegramClient()
+        fake.updates = [[self.message_update(3, 111, first_name="Stranger")], [self.message_update(4, 222)]]
+        asked: list[str] = []
+        chat_id, output = self.run_setup(settings, fake, confirm=lambda prompt: asked.append(prompt) or "y")
+        self.assertEqual(chat_id, 222)
+        self.assertEqual(len(asked), 1)
+        self.assertNotIn("Stranger", output)
+        self.assertEqual(Store(settings.db_path).get_value(OFFSET_KEY), "5")
+
+    def test_group_chat_is_refused_with_a_note(self) -> None:
+        """A group message is never offered; a note is printed and waiting continues."""
+        settings = self.make_settings()
+        fake = FakeTelegramClient()
+        fake.updates = [[], [self.message_update(5, -900, chat_type="group")], [self.message_update(6, 42)]]
+        chat_id, output = self.run_setup(settings, fake)
+        self.assertEqual(chat_id, 42)
+        self.assertIn("group or channel", output)
+        self.assertNotIn("-900", output)
+
+    def test_answer_no_does_not_save_and_times_out(self) -> None:
+        """Answering "n" saves no chat id; with nothing else arriving the setup times out."""
+        settings = self.make_settings()
+        fake = FakeTelegramClient()
+        fake.updates = [[], [self.message_update(7, 555)]]
+        with self.assertRaises(AutopilotError):
+            self.run_setup(settings, fake, confirm=lambda prompt: "n", monotonic=TickingClock(10.0))
+        self.assertNotIn("TELEGRAM_CHAT_ID", dotenv_values(settings.env_file))
+        self.assertEqual(fake.sent, [])
+
+    def test_no_then_yes_uses_the_second_message(self) -> None:
+        """After a refusal the next confirmed message is the one saved."""
+        settings = self.make_settings()
+        fake = FakeTelegramClient()
+        fake.updates = [[], [self.message_update(7, 555)], [self.message_update(8, 666)]]
+        answers = iter(["n", "YES"])
+        chat_id, _ = self.run_setup(settings, fake, confirm=lambda prompt: next(answers))
+        self.assertEqual(chat_id, 666)
+
+    def test_default_output_is_resolved_at_call_time(self) -> None:
+        """Without `out`, progress goes to the sys.stdout in force when the function runs."""
+        settings = self.make_settings()
+        fake = FakeTelegramClient()
+        fake.updates = [[], [self.message_update(1, 5)]]
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            telegram_setup(
+                settings,
+                secret_input=lambda prompt: TOKEN,
+                client_factory=lambda token: fake,
+                monotonic=TickingClock(1.0),
+                confirm=lambda prompt: "y",
+            )
+        self.assertIn("https://t.me/", captured.getvalue())
 
     def test_existing_token_is_not_prompted(self) -> None:
         """A token already in the settings is used without asking."""
         settings = self.make_settings(TELEGRAM_BOT_TOKEN=TOKEN)
         fake = FakeTelegramClient()
-        fake.updates = [[self.message_update(1, -100)]]
+        fake.updates = [[], [self.message_update(1, 100)]]
 
         def refuse(prompt: str) -> str:
+            """Fail the test if the token is asked for."""
             raise AssertionError("must not prompt")
 
         chat_id, _ = self.run_setup(settings, fake, secret_input=refuse)
-        self.assertEqual(chat_id, -100)
+        self.assertEqual(chat_id, 100)
 
     def test_updates_without_a_message_are_skipped(self) -> None:
         """An update that is not a message is passed over and the next batch is read."""
         settings = self.make_settings()
         fake = FakeTelegramClient()
-        fake.updates = [[{"update_id": 3, "edited_message": {}}], [self.message_update(4, 9)]]
+        fake.updates = [[], [{"update_id": 3, "edited_message": {}}], [self.message_update(4, 9)]]
         chat_id, _ = self.run_setup(settings, fake)
         self.assertEqual(chat_id, 9)
         self.assertEqual(Store(settings.db_path).get_value(OFFSET_KEY), "5")
@@ -416,6 +521,13 @@ class InitProjectTests(AppTestCase):
         created = init_project(self.home)
         self.assertEqual(created, ["tasks.toml", ".env"])
         self.assertTrue((self.home / "tasks.toml").read_text().strip())
+        self.assertEqual(stat.S_IMODE((self.home / ".env").stat().st_mode), 0o600)
+
+    def test_env_file_is_never_world_readable_while_created(self) -> None:
+        """.env is created with mode 0600 from the start (umask 0 would expose a later chmod gap)."""
+        old = os.umask(0)
+        self.addCleanup(os.umask, old)
+        init_project(self.home)
         self.assertEqual(stat.S_IMODE((self.home / ".env").stat().st_mode), 0o600)
 
     def test_never_overwrites(self) -> None:

@@ -34,7 +34,13 @@ from autopilot.models import STATUS_RATE_LIMITED, STATUS_SUCCESS, RunOptions
 from autopilot.runner import ClaudeRunner, find_claude_binary
 from autopilot.service import UNIT_NAME, linger_enabled
 from autopilot.settings import Settings
-from autopilot.system import CommandRunner, run_command
+from autopilot.system import (
+    EXIT_NOT_EXECUTABLE,
+    EXIT_NOT_FOUND,
+    EXIT_TIMED_OUT,
+    CommandRunner,
+    run_command,
+)
 from autopilot.tasks import load_task_config
 from autopilot.telegram_api import TelegramClient
 
@@ -44,6 +50,8 @@ STATUS_FAIL = "fail"
 STATUS_MARKS = {STATUS_OK: "✔", STATUS_WARN: "!", STATUS_FAIL: "✘"}
 
 COMMAND_TIMEOUT_SECONDS = 20.0
+# Longest command output quoted in a result detail.
+MAX_REASON_CHARS = 200
 LIVE_TIMEOUT_SECONDS = 120
 LIVE_MODEL = "haiku"
 LIVE_PROMPT = "Reply with the single word OK."
@@ -55,6 +63,7 @@ FIX_INDENT = "    "
 FIX_INSTALL_CLAUDE = "Install Claude Code (`claude install`) or set CLAUDE_BIN in .env."
 FIX_LOGIN = "Run `claude auth login` and sign in with your Claude subscription."
 FIX_TASKS = "Edit tasks.toml, then run `autopilot validate`."
+FIX_TASKS_MISSING = "Run `autopilot init` to create it."
 FIX_TELEGRAM = "Run `autopilot telegram-setup`."
 FIX_SERVICE = "Run `autopilot install-service` to start it at boot."
 FIX_LINGER = "Run `sudo loginctl enable-linger $USER` to keep it running without a login."
@@ -122,7 +131,7 @@ def check_claude_login(binary: Path, run: CommandRunner) -> CheckResult:
     code, stdout, stderr = run([str(binary), "auth", "status", "--json"], COMMAND_TIMEOUT_SECONDS)
     status = _parse_json_object(stdout)
     if status is None:
-        reason = (stderr or stdout).strip()[:200] or f"exit code {code}"
+        reason = (stderr or stdout).strip()[:MAX_REASON_CHARS] or f"exit code {code}"
         return CheckResult(name, STATUS_WARN, f"could not read the login status ({reason})", FIX_LOGIN)
     if not status.get("loggedIn"):
         return CheckResult(name, STATUS_FAIL, "not logged in", FIX_LOGIN)
@@ -185,7 +194,8 @@ def check_tasks(settings: Settings) -> CheckResult:
     try:
         config = load_task_config(settings.tasks_file)
     except AutopilotError as err:
-        return CheckResult(name, STATUS_FAIL, str(err), FIX_TASKS)
+        fix = FIX_TASKS if settings.tasks_file.is_file() else FIX_TASKS_MISSING
+        return CheckResult(name, STATUS_FAIL, str(err), fix)
     enabled = sum(1 for task in config.tasks.values() if task.enabled)
     return CheckResult(name, STATUS_OK, f"{len(config.tasks)} tasks ({enabled} enabled)")
 
@@ -251,7 +261,7 @@ def check_service(run: CommandRunner, user: str) -> CheckResult:
     """
     name = "Service"
     code, stdout, _ = run(["systemctl", "--user", "is-enabled", UNIT_NAME], COMMAND_TIMEOUT_SECONDS)
-    if code in (124, 126, 127):
+    if code in (EXIT_TIMED_OUT, EXIT_NOT_EXECUTABLE, EXIT_NOT_FOUND):
         return CheckResult(name, STATUS_WARN, "systemd is not available here, run `autopilot start` by hand")
     enabled = stdout.strip() == "enabled"
     if not enabled:

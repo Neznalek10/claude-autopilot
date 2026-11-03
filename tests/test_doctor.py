@@ -199,6 +199,7 @@ class TasksTests(DoctorTestCase):
         result = check_tasks(self.make_settings())
         self.assertEqual(result.status, "fail")
         self.assertIn("autopilot init", result.detail)
+        self.assertEqual(result.fix, "Run `autopilot init` to create it.")
 
     def test_invalid_file_fails_naming_the_field(self) -> None:
         """A typo in a key is reported with the key name."""
@@ -207,6 +208,7 @@ class TasksTests(DoctorTestCase):
         result = check_tasks(settings)
         self.assertEqual(result.status, "fail")
         self.assertIn("shedule", result.detail)
+        self.assertIn("autopilot validate", result.fix)
 
 
 class TelegramTests(DoctorTestCase):
@@ -215,6 +217,7 @@ class TelegramTests(DoctorTestCase):
     def test_not_configured_warns(self) -> None:
         """Nothing configured: warn with the setup command; the factory is never called."""
         def factory(token: str) -> FakeTelegramClient:
+            """Fail the test if a client is built."""
             raise AssertionError("must not be called")
 
         result = check_telegram(self.make_settings(), factory)  # type: ignore[arg-type]
@@ -234,6 +237,7 @@ class TelegramTests(DoctorTestCase):
         seen: list[str] = []
 
         def factory(token: str) -> FakeTelegramClient:
+            """Record the token and return a working fake."""
             seen.append(token)
             return FakeTelegramClient()
 
@@ -248,7 +252,10 @@ class TelegramTests(DoctorTestCase):
         settings = self.make_settings(TELEGRAM_BOT_TOKEN=TOKEN, TELEGRAM_CHAT_ID="5")
 
         class Rejecting:
+            """Client whose token Telegram rejects."""
+
             def get_me(self) -> dict:
+                """Fail like Telegram answering 401."""
                 raise TelegramError("Telegram getMe failed: Unauthorized", status=401)
 
         result = check_telegram(settings, lambda token: Rejecting())  # type: ignore[arg-type,return-value]
