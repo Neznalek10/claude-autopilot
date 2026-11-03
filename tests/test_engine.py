@@ -25,6 +25,7 @@ from unittest import mock
 
 from autopilot.engine import (
     CHAT_IDLE_RESET,
+    CHAT_RESET_KEY,
     CHAT_SESSION_KEY,
     CHAT_UPDATED_KEY,
     DEFAULT_RETRY_DELAY,
@@ -329,6 +330,7 @@ class ConfigTests(EngineTestCase):
     def test_load_config_error_propagates(self) -> None:
         """A broken config at startup fails loudly."""
         def broken() -> TaskConfig:
+            """Fail like a loader that meets an invalid tasks.toml."""
             raise ConfigError("tasks.toml: nope")
 
         engine = self.make_engine(config_loader=broken)
@@ -469,6 +471,7 @@ class TickTests(EngineTestCase):
         real = self.store.is_paused
 
         def flaky(name: str) -> bool:
+            """Raise for the "news" task only, like a database hiccup mid-tick."""
             if name == "news":
                 raise RuntimeError("db hiccup")
             return real(name)
@@ -673,6 +676,7 @@ class ExecuteTests(EngineTestCase):
         seen: list[tuple[int, int]] = []
 
         def peek() -> None:
+            """Record the queue snapshot taken while the runner is busy."""
             snap = self.engine.snapshot()
             seen.append((len(snap.running), len(snap.queued)))
 
@@ -830,6 +834,7 @@ class RateLimitTests(EngineTestCase):
         original = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
         previous = original
         for _ in range(3):
+            self.store.mark_running(previous, START)
             self.store.finish_run(previous, status=STATUS_RATE_LIMITED, finished_at=START)
             previous = self.store.create_run(
                 task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START, retry_of=previous
@@ -846,10 +851,41 @@ class RateLimitTests(EngineTestCase):
         self.clock.advance(days=1)
         self.assertEqual(self.store.due_retries(self.clock()), [])
 
+    def test_gate_deferrals_do_not_use_up_the_retries(self) -> None:
+        """Links created by gate deferrals never called Claude, so they don't count towards giving up."""
+        previous = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        # One real attempt followed by four deferrals: depth 5, but only one started run.
+        self.store.mark_running(previous, START)
+        for _ in range(5):
+            self.store.finish_run(previous, status=STATUS_RATE_LIMITED, finished_at=START)
+            previous = self.store.create_run(
+                task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START, retry_of=previous
+            )
+        self.runner.queue(self.limit(START + timedelta(hours=1)))
+        record = self.run_now(previous)
+        self.assertEqual(self.store.retry_depth(previous), 5)
+        self.assertEqual(len(self.runner.calls), 1)
+        self.assertIsNotNone(record.retry_at)
+        self.assertNotIn("Gave up", record.error or "")
+
+    def test_deferred_run_in_a_long_chain_still_waits_instead_of_giving_up(self) -> None:
+        """A run behind a closed gate is deferred without Claude and never gives up."""
+        self.store.set_value(LIMITED_UNTIL_KEY, (START + timedelta(hours=1)).isoformat())
+        previous = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        for _ in range(4):
+            self.store.finish_run(previous, status=STATUS_RATE_LIMITED, finished_at=START)
+            previous = self.store.create_run(
+                task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START, retry_of=previous
+            )
+        record = self.run_now(previous)
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(record.retry_at, START + timedelta(hours=1))
+
     def test_third_retry_is_still_allowed(self) -> None:
         """A run at retry depth 2 is limited again and still schedules another retry."""
         previous = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
         for _ in range(2):
+            self.store.mark_running(previous, START)
             self.store.finish_run(previous, status=STATUS_RATE_LIMITED, finished_at=START)
             previous = self.store.create_run(
                 task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START, retry_of=previous
@@ -936,6 +972,74 @@ class ChatTests(EngineTestCase):
         self.chat()
         self.assertIsNone(self.runner.calls[0].resume_session)
 
+    def test_idle_reset_value_is_six_hours(self) -> None:
+        """CHAT_IDLE_RESET follows the shared CHAT_IDLE_HOURS constant (6 hours)."""
+        self.assertEqual(CHAT_IDLE_RESET, timedelta(hours=6))
+
+    def test_reset_chat_records_the_reset_time(self) -> None:
+        """reset_chat stores chat_reset_at = now next to clearing the session."""
+        self.store.set_value(CHAT_SESSION_KEY, "s1")
+        self.engine.reset_chat()
+        self.assertEqual(self.store.get_value(CHAT_RESET_KEY), START.isoformat())
+
+    def test_turn_queued_before_new_never_stores_its_session(self) -> None:
+        """A turn queued before /new must not bring the old conversation back.
+
+        Chat A is queued, the user sends /new, chat B is queued; A and B then
+        run in queue order. B must start fresh and the turn after it must
+        resume B's session, not A's.
+        """
+        self.runner.queue(success(session_id="old"), success(session_id="new"), success(session_id="new"))
+        turn_a = self.engine.enqueue_prompt("A", dispatch=False)
+        self.clock.advance(seconds=1)
+        self.engine.reset_chat()
+        self.clock.advance(seconds=1)
+        turn_b = self.engine.enqueue_prompt("B", dispatch=False)
+        self.run_now(turn_a)
+        self.run_now(turn_b)
+        self.chat("C")
+        self.assertEqual([c.resume_session for c in self.runner.calls], [None, None, "new"])
+        self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "new")
+
+    def test_late_old_turn_cannot_overwrite_the_new_conversation(self) -> None:
+        """A turn from before /new that finishes after the new conversation started is ignored."""
+        self.runner.queue(success(session_id="new"), success(session_id="old"))
+        turn_a = self.engine.enqueue_prompt("A", dispatch=False)
+        self.clock.advance(seconds=1)
+        self.engine.reset_chat()
+        self.clock.advance(seconds=1)
+        turn_b = self.engine.enqueue_prompt("B", dispatch=False)
+        self.run_now(turn_b)
+        self.run_now(turn_a)
+        self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "new")
+
+    def test_turn_queued_after_new_stores_its_session(self) -> None:
+        """Only turns queued at or before the reset are affected; later ones store normally."""
+        self.engine.reset_chat()
+        self.clock.advance(seconds=1)
+        self.runner.queue(success(session_id="s1"))
+        self.chat()
+        self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "s1")
+
+    def test_idle_expiry_and_failed_turns_are_not_user_resets(self) -> None:
+        """Automatic resets don't write chat_reset_at, so queued turns still store their sessions."""
+        self.runner.queue(success(session_id="s1"), success(session_id="s2"),
+                          RunOutcome(status=STATUS_ERROR, error="x"))
+        self.chat()
+        self.clock.advance(hours=7)
+        self.chat()  # idle expiry, then stores s2
+        self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "s2")
+        self.chat()  # resumed turn fails and clears the session
+        self.assertIsNone(self.store.get_value(CHAT_SESSION_KEY))
+        self.assertIsNone(self.store.get_value(CHAT_RESET_KEY))
+
+    def test_unreadable_reset_marker_is_ignored(self) -> None:
+        """A corrupt chat_reset_at value does not stop sessions from being stored."""
+        self.store.set_value(CHAT_RESET_KEY, "garbage")
+        self.runner.queue(success(session_id="s1"))
+        self.chat()
+        self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "s1")
+
     def test_reset_chat_starts_a_new_conversation(self) -> None:
         """After reset_chat the next turn has no session."""
         self.runner.queue(success(session_id="s1"))
@@ -1002,6 +1106,7 @@ class ChatTests(EngineTestCase):
         release_first = threading.Event()
 
         def block_first_call() -> None:
+            """Hold the first runner call until the test releases it."""
             if len(self.runner.calls) == 1:
                 first_started.set()
                 release_first.wait(WAIT_SECONDS)
@@ -1088,6 +1193,7 @@ class WorkerTests(EngineTestCase):
         real = self.engine.execute_run
 
         def flaky(run_id: int) -> RunRecord | None:
+            """Raise for the first run and delegate every other run to the real method."""
             if run_id == first:
                 raise RuntimeError("store exploded")
             return real(run_id)
@@ -1118,11 +1224,64 @@ class WorkerTests(EngineTestCase):
         run_id = engine.enqueue_task("news", TRIGGER_MANUAL)
         self.assertEqual(self.store.get_run(run_id).status, STATUS_QUEUED)
 
-    def test_run_forever_recovers_ticks_executes_and_stops(self) -> None:
-        """The loop marks interrupted runs, queues due slots, runs them and ends on stop."""
+    def test_recover_interrupted_fails_leftover_runs_and_returns_the_count(self) -> None:
+        """recover_interrupted marks queued and running leftovers as errors and counts them."""
+        running = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        self.store.mark_running(running, START)
+        queued = self.store.create_run(task_name="plan", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        with self.assertLogs("autopilot.engine", level="WARNING"):
+            self.assertEqual(self.engine.recover_interrupted(), 2)
+        self.assertEqual(self.store.get_run(running).status, STATUS_ERROR)
+        self.assertEqual(self.store.get_run(queued).status, STATUS_ERROR)
+        self.assertEqual(self.engine.recover_interrupted(), 0)
+
+    def test_stop_terminates_in_flight_claude_processes_when_the_runner_can(self) -> None:
+        """stop() asks a runner that offers terminate_all to kill its live processes."""
+
+        class TerminatingRunner(ScriptedRunner):
+            """ScriptedRunner that also offers ClaudeRunner's terminate_all."""
+
+            terminated = 0
+
+            def terminate_all(self) -> int:
+                """Count the call and report one killed process."""
+                self.terminated += 1
+                return 1
+
+        runner = TerminatingRunner()
+        engine = self.make_engine(runner=runner)
+        engine.load_config()
+        engine.start_workers()
+        with self.assertLogs("autopilot.engine", level="INFO"):
+            engine.stop()
+        self.assertEqual(runner.terminated, 1)
+
+    def test_stop_without_terminate_all_on_the_runner_still_works(self) -> None:
+        """A runner without terminate_all (only the Runner protocol) is simply not asked."""
+        self.engine.start_workers()
+        self.engine.stop()
+        self.assertEqual([t for t in threading.enumerate() if t.name.startswith("engine-worker-")], [])
+
+    def test_run_forever_does_not_recover_runs_queued_before_it_starts(self) -> None:
+        """Recovery is the caller's job: a run queued before the loop starts (for example by the
+        bot thread) must survive and be executed, not be marked interrupted."""
+        run_id = self.engine.enqueue_prompt("early chat message")
+        stop = threading.Event()
+        thread = threading.Thread(target=self.engine.run_forever, args=(stop,))
+        thread.start()
+        try:
+            self.assertTrue(wait_until(lambda: self.store.get_run(run_id).status == STATUS_SUCCESS))
+        finally:
+            stop.set()
+            thread.join(WAIT_SECONDS)
+        self.assertEqual(len(self.runner.calls), 1)
+
+    def test_run_forever_ticks_executes_and_stops(self) -> None:
+        """After recovery the loop queues due slots, runs them and ends on stop."""
         stale = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
         self.store.mark_running(stale, START)
         self.store.set_last_scheduled("news", START - timedelta(days=1))
+        self.engine.recover_interrupted()
         stop = threading.Event()
         thread = threading.Thread(target=self.engine.run_forever, args=(stop,))
         thread.start()
@@ -1151,6 +1310,7 @@ class WorkerTests(EngineTestCase):
         failed = threading.Event()
 
         def boom() -> list[int]:
+            """Signal that tick was reached, then fail."""
             failed.set()
             raise RuntimeError("tick broke")
 

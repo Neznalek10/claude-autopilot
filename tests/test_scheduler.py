@@ -13,8 +13,8 @@ from unittest import mock
 
 from autopilot import scheduler
 from autopilot.models import DueRun
-from autopilot.schedule import parse_schedule
-from autopilot.scheduler import evaluate, latest_slot, next_fire_time
+from autopilot.schedule import Schedule, parse_schedule
+from autopilot.scheduler import evaluate, latest_slot, next_fire_time, to_utc
 from helpers import TZ, make_task
 
 NOW = datetime(2026, 11, 2, 7, 30, tzinfo=TZ)  # a Monday
@@ -45,6 +45,23 @@ def daily_task(*expressions: str):
         A Task with those schedules.
     """
     return make_task(schedules=tuple(parse_schedule(e) for e in expressions))
+
+
+class ToUtcTests(unittest.TestCase):
+    """to_utc is the shared helper for ordering and subtracting datetimes."""
+
+    def test_converts_to_the_same_instant_in_utc(self) -> None:
+        """The instant is unchanged; only the zone becomes UTC."""
+        result = to_utc(NOW)
+        self.assertEqual(result, NOW)
+        self.assertEqual(result.utcoffset(), timedelta(0))
+        self.assertEqual(result.hour, 6)
+
+    def test_orders_the_two_passes_of_the_repeated_hour(self) -> None:
+        """Two wall-clock-equal moments with different folds still differ by an hour in UTC."""
+        first = datetime(2026, 10, 25, 2, 30, tzinfo=TZ)
+        second = datetime(2026, 10, 25, 2, 30, fold=1, tzinfo=TZ)
+        self.assertEqual(to_utc(second) - to_utc(first), timedelta(hours=1))
 
 
 class NextFireTimeTests(unittest.TestCase):
@@ -113,6 +130,30 @@ class LatestSlotTests(unittest.TestCase):
         after = datetime(2026, 10, 24, 7, 30, tzinfo=timezone(timedelta(hours=2)))
         now = datetime(2026, 10, 26, 7, 30, tzinfo=TZ)
         self.assertEqual(latest_slot(task, after, now), now)
+
+    def test_dense_schedule_over_a_long_gap_scans_only_the_recent_window(self) -> None:
+        """Every minute over 30 days is answered from the last 24 hours (about 1440 steps)."""
+        task = daily_task("every 1m")
+        original = Schedule.next_after
+        with mock.patch.object(Schedule, "next_after", autospec=True, side_effect=original) as spy:
+            slot = latest_slot(task, NOW - timedelta(days=30), NOW)
+        self.assertEqual(slot, NOW)
+        self.assertLess(spy.call_count, 1500)
+
+    def test_slot_older_than_the_window_is_found_by_the_fallback(self) -> None:
+        """A weekly task last due 3 days ago is found although the recent window is empty."""
+        task = daily_task("mon 07:30")
+        self.assertEqual(latest_slot(task, NOW - timedelta(days=10), NOW + timedelta(days=3)), NOW)
+
+    def test_window_and_full_scan_agree(self) -> None:
+        """The window shortcut never changes the answer, whatever the start is."""
+        task = daily_task("every 15m", "daily 03:10")
+        for hours_back in (1, 23, 24, 25, 72):
+            with self.subTest(hours_back=hours_back):
+                after = NOW - timedelta(hours=hours_back)
+                with mock.patch.object(scheduler, "RECENT_WINDOW", timedelta(days=400)):
+                    expected = latest_slot(task, after, NOW)
+                self.assertEqual(latest_slot(task, after, NOW), expected)
 
     def test_naive_arguments_are_rejected(self) -> None:
         """Naive ``after`` or ``now`` raise ValueError."""

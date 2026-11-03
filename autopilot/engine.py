@@ -31,12 +31,13 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from autopilot.errors import ConfigError, TaskNotFoundError
 from autopilot.models import (
     ASK_TASK_NAME,
+    CHAT_IDLE_HOURS,
     NOTIFY_ALWAYS,
     NOTIFY_ERRORS,
     NOTIFY_NEVER,
@@ -56,7 +57,7 @@ from autopilot.models import (
     Runner,
     TaskConfig,
 )
-from autopilot.scheduler import evaluate, next_fire_time
+from autopilot.scheduler import evaluate, next_fire_time, to_utc
 from autopilot.store import Store
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,11 @@ MAX_RATE_LIMIT_RETRIES = 3
 LIMITED_UNTIL_KEY = "limited_until"
 CHAT_SESSION_KEY = "chat_session"
 CHAT_UPDATED_KEY = "chat_updated_at"
-CHAT_IDLE_RESET = timedelta(hours=6)
+CHAT_RESET_KEY = "chat_reset_at"
+CHAT_IDLE_RESET = timedelta(hours=CHAT_IDLE_HOURS)
+# Time formats: "HH:MM" in user notices, a full date and time in log lines.
+CLOCK_TIME_FORMAT = "%H:%M"
+LOG_SLOT_TIME_FORMAT = "%Y-%m-%d %H:%M"
 # How long stop() waits for workers to finish their current run before giving up on them.
 WORKER_JOIN_SECONDS = 5
 
@@ -80,18 +85,6 @@ LIMIT_NOTICE = (
 )
 LIMIT_WAIT_MESSAGE = "Waiting for the Claude usage limit to reset at {time}."
 GIVE_UP_MESSAGE = "Gave up after {retries} retries because of the usage limit."
-
-
-def _utc(moment: datetime) -> datetime:
-    """Return ``moment`` as a UTC datetime, for ordering and subtraction.
-
-    Args:
-        moment: An aware datetime.
-
-    Returns:
-        The same instant with tzinfo UTC.
-    """
-    return moment.astimezone(timezone.utc)
 
 
 def _clock_time(moment: datetime, now: datetime) -> str:
@@ -106,7 +99,7 @@ def _clock_time(moment: datetime, now: datetime) -> str:
     Returns:
         The wall-clock time, e.g. "08:30".
     """
-    return moment.astimezone(now.tzinfo).strftime("%H:%M")
+    return moment.astimezone(now.tzinfo).strftime(CLOCK_TIME_FORMAT)
 
 
 class LogNotifier:
@@ -384,9 +377,40 @@ class Engine:
         return run_id
 
     def reset_chat(self) -> None:
-        """Forget the chat session so the next chat turn starts a new conversation."""
+        """Start a new conversation (the user's /new).
+
+        Forgets the stored session and records the reset time. A chat turn that
+        was queued at or before that time (it may still be waiting or running)
+        belongs to the old conversation, so it never stores its session and
+        cannot bring the old conversation back.
+        """
+        self._clear_chat_session()
+        self._store.set_value(CHAT_RESET_KEY, self._clock().isoformat())
+
+    def _clear_chat_session(self) -> None:
+        """Delete the stored session and its timestamp, without marking a user reset."""
         self._store.set_value(CHAT_SESSION_KEY, None)
         self._store.set_value(CHAT_UPDATED_KEY, None)
+
+    def _was_chat_reset_since(self, queued_at: datetime) -> bool:
+        """Tell whether the user reset the conversation after a chat turn was queued.
+
+        Args:
+            queued_at: When the turn was queued.
+
+        Returns:
+            True when a reset happened at or after ``queued_at``.
+        """
+        raw = self._store.get_value(CHAT_RESET_KEY)
+        if raw is None:
+            return False
+        try:
+            reset_at = datetime.fromisoformat(raw)
+        except ValueError:
+            return False
+        if reset_at.utcoffset() is None:
+            return False
+        return to_utc(queued_at) <= to_utc(reset_at)
 
     # ------------------------------------------------------------------- tick
 
@@ -405,7 +429,8 @@ class Engine:
         for name in list(self.config.tasks):
             try:
                 run_id = self._tick_task(name, now)
-            except Exception:  # noqa: BLE001 - one broken task must not stop the others
+            # Deliberately broad: a bug in one task's schedule must not stop the other tasks.
+            except Exception:
                 logger.exception("Could not evaluate the schedule of task '%s'", name)
                 continue
             if run_id is not None:
@@ -437,7 +462,7 @@ class Engine:
             logger.info(
                 "Skipped the missed slot of task '%s' at %s (too late to run)",
                 name,
-                marker.astimezone(now.tzinfo).strftime("%Y-%m-%d %H:%M"),
+                marker.astimezone(now.tzinfo).strftime(LOG_SLOT_TIME_FORMAT),
             )
         return None
 
@@ -454,7 +479,8 @@ class Engine:
         for original in self._store.due_retries(now):
             try:
                 run_id = self._queue_retry(original)
-            except Exception:  # noqa: BLE001 - one broken retry must not stop the others
+            # Deliberately broad: a failure on one retry must not stop the other retries.
+            except Exception:
                 logger.exception("Could not queue the retry of run #%d", original.id)
                 continue
             if run_id is not None:
@@ -506,7 +532,7 @@ class Engine:
                 times[name] = None
                 continue
             marker = self._store.get_last_scheduled(name)
-            start = now if marker is None else max(now, marker, key=_utc)
+            start = now if marker is None else max(now, marker, key=to_utc)
             # Fixed-offset store datetimes must become zoned first, or DST is ignored.
             times[name] = next_fire_time(task, start.astimezone(now.tzinfo))
         return times
@@ -541,7 +567,7 @@ class Engine:
         except ValueError:
             logger.warning("Ignoring unreadable %s value %r", LIMITED_UNTIL_KEY, raw)
             return None
-        if until.utcoffset() is None or _utc(until) <= _utc(now):
+        if until.utcoffset() is None or to_utc(until) <= to_utc(now):
             return None
         return until
 
@@ -619,7 +645,9 @@ class Engine:
         outcome = self._call_runner(record, options, resume_session)
         finished_at = self._clock()
         if is_chat:
-            outcome = self._apply_chat_outcome(outcome, resumed=resume_session is not None, now=finished_at)
+            outcome = self._apply_chat_outcome(
+                record, outcome, resumed=resume_session is not None, now=finished_at
+            )
         if outcome.status == STATUS_RATE_LIMITED:
             return self._finish_rate_limited(record, outcome, finished_at)
         finished = self._store_outcome(record.id, outcome, finished_at)
@@ -641,7 +669,8 @@ class Engine:
         """
         try:
             return self._runner.run(record.prompt, options, resume_session)
-        except Exception as err:  # noqa: BLE001 - a worker must survive any runner failure
+        # Deliberately broad: any runner bug becomes an error run instead of killing the worker.
+        except Exception as err:
             logger.exception("Run #%d crashed", record.id)
             return RunOutcome(status=STATUS_ERROR, error=str(err) or type(err).__name__)
 
@@ -692,18 +721,23 @@ class Engine:
             updated = None if updated_raw is None else datetime.fromisoformat(updated_raw)
         except ValueError:
             updated = None
-        if updated is None or updated.utcoffset() is None or _utc(now) - _utc(updated) > CHAT_IDLE_RESET:
-            self.reset_chat()
+        if updated is None or updated.utcoffset() is None or to_utc(now) - to_utc(updated) > CHAT_IDLE_RESET:
+            # An expired session is dropped quietly; it is not a user reset.
+            self._clear_chat_session()
             return None
         return session
 
-    def _apply_chat_outcome(self, outcome: RunOutcome, *, resumed: bool, now: datetime) -> RunOutcome:
+    def _apply_chat_outcome(
+        self, record: RunRecord, outcome: RunOutcome, *, resumed: bool, now: datetime
+    ) -> RunOutcome:
         """Update the stored conversation after a chat turn.
 
-        A success with a session id becomes the new current session. A failed
+        A success with a session id becomes the new current session, unless the
+        user started a new conversation after this turn was queued. A failed
         resumed turn discards the conversation, because its session may be broken.
 
         Args:
+            record: The chat run that just finished.
             outcome: The runner's outcome for the turn.
             resumed: Whether the turn resumed an existing session.
             now: The current moment, stored as the conversation's last activity.
@@ -713,10 +747,11 @@ class Engine:
             conversation was reset.
         """
         if outcome.status == STATUS_SUCCESS and outcome.session_id:
-            self._store.set_value(CHAT_SESSION_KEY, outcome.session_id)
-            self._store.set_value(CHAT_UPDATED_KEY, now.isoformat())
+            if not self._was_chat_reset_since(record.queued_at):
+                self._store.set_value(CHAT_SESSION_KEY, outcome.session_id)
+                self._store.set_value(CHAT_UPDATED_KEY, now.isoformat())
         elif outcome.status == STATUS_ERROR and resumed:
-            self.reset_chat()
+            self._clear_chat_session()
             error = f"{outcome.error} {CHAT_RESET_NOTE}" if outcome.error else CHAT_RESET_NOTE
             return dataclasses.replace(outcome, error=error)
         return outcome
@@ -734,7 +769,7 @@ class Engine:
         Returns:
             The finished record.
         """
-        if self._store.retry_depth(record.id) >= MAX_RATE_LIMIT_RETRIES:
+        if self._started_retries(record) >= MAX_RATE_LIMIT_RETRIES:
             giving_up = dataclasses.replace(
                 outcome, error=GIVE_UP_MESSAGE.format(retries=MAX_RATE_LIMIT_RETRIES)
             )
@@ -745,6 +780,32 @@ class Engine:
         finished = self._store_outcome(record.id, outcome, now, retry_at=retry_at)
         self._close_gate(retry_at, now)
         return finished
+
+    def _started_retries(self, record: RunRecord) -> int:
+        """Count the earlier attempts in a retry chain that actually called Claude.
+
+        Runs deferred by the closed gate never started, so they must not use up
+        the retries a run is allowed.
+
+        Args:
+            record: The run being finished.
+
+        Returns:
+            How many runs above it in the ``retry_of`` chain have a start time.
+        """
+        started = 0
+        seen = {record.id}
+        parent_id = record.retry_of
+        # ``seen`` guards against a corrupt cycle in the chain.
+        while parent_id is not None and parent_id not in seen:
+            seen.add(parent_id)
+            parent = self._store.get_run(parent_id)
+            if parent is None:
+                break
+            if parent.started_at is not None:
+                started += 1
+            parent_id = parent.retry_of
+        return started
 
     def _close_gate(self, until: datetime, now: datetime) -> None:
         """Hold every run until the usage limit resets and tell the user once.
@@ -774,7 +835,8 @@ class Engine:
             return
         try:
             self._notifier.notify_run(record)
-        except Exception:  # noqa: BLE001 - delivery problems must never break the engine
+        # Deliberately broad: any notifier failure is logged, never raised into the engine.
+        except Exception:
             logger.exception("Could not notify about run #%d", record.id)
 
     def _should_notify(self, record: RunRecord) -> bool:
@@ -803,7 +865,8 @@ class Engine:
         """
         try:
             self._notifier.notify_text(text)
-        except Exception:  # noqa: BLE001 - delivery problems must never break the engine
+        # Deliberately broad: any notifier failure is logged, never raised into the engine.
+        except Exception:
             logger.exception("Could not send a notice")
 
     # ---------------------------------------------------------------- workers
@@ -826,37 +889,56 @@ class Engine:
                 return
             try:
                 self.execute_run(run_id)
-            except Exception:  # noqa: BLE001 - the worker must survive any failure
+            # Deliberately broad: the worker thread must keep serving later runs whatever fails.
+            except Exception:
                 logger.exception("Worker failed on run #%d", run_id)
 
     def stop(self) -> None:
-        """Ask the workers to exit and wait briefly for them.
+        """Ask the workers to exit, end in-flight Claude processes and wait briefly.
 
-        A run still in progress is not interrupted: the daemon worker ends with
-        the process, and the next start marks that run as interrupted.
+        Queued runs stay in the store; the next start marks them as interrupted.
+        A runner that offers ``terminate_all`` (ClaudeRunner does) is asked to
+        kill the Claude processes still running, so none outlives the service.
         """
         self._stopping.set()
         for _ in self._workers:
             self._queue.put(None)
+        # Optional runner capability: the Runner protocol only requires run().
+        terminate_all = getattr(self._runner, "terminate_all", None)
+        if callable(terminate_all):
+            terminated = terminate_all()
+            if terminated:
+                logger.info("Terminated %d running Claude process(es)", terminated)
         deadline = time.monotonic() + WORKER_JOIN_SECONDS
         for worker in self._workers:
             worker.join(timeout=max(0.0, deadline - time.monotonic()))
         self._workers = []
 
+    def recover_interrupted(self) -> int:
+        """Mark runs left queued or running by a previous process as failed.
+
+        Call once at startup, before anything can queue a run (the bot thread
+        included), or fresh runs would be marked interrupted too.
+
+        Returns:
+            How many runs were recovered.
+        """
+        recovered = self._store.recover_interrupted(self._clock())
+        if recovered:
+            logger.warning("Marked %d interrupted run(s) from the previous session as failed", recovered)
+        return recovered
+
     def run_forever(self, stop: threading.Event) -> None:
         """Run the service loop until ``stop`` is set.
 
-        Marks runs left over from a previous process as interrupted, starts the
-        workers, then ticks. Between ticks it sleeps until the next schedule
+        Starts the workers, then ticks. Call ``recover_interrupted`` first.
+        Between ticks it sleeps until the next schedule
         fires, but never longer than TICK_SECONDS (so edits to tasks.toml are
         picked up) and never shorter than MIN_WAIT_SECONDS.
 
         Args:
             stop: Event set by the caller (for example a signal handler) to end the loop.
         """
-        recovered = self._store.recover_interrupted(self._clock())
-        if recovered:
-            logger.warning("Marked %d interrupted run(s) from the previous session as failed", recovered)
         self.start_workers()
         try:
             while not stop.is_set():
@@ -864,7 +946,8 @@ class Engine:
                 try:
                     self.tick()
                     wait = self._seconds_until_wake()
-                except Exception:  # noqa: BLE001 - the service loop must never die
+                # Deliberately broad: a failed tick is logged and retried at the next one.
+                except Exception:
                     logger.exception("Tick failed")
                 stop.wait(wait)
         finally:
@@ -881,5 +964,5 @@ class Engine:
         upcoming = [moment for moment in self.next_fire_times().values() if moment is not None]
         if not upcoming:
             return float(TICK_SECONDS)
-        seconds = (_utc(min(upcoming, key=_utc)) - _utc(now)).total_seconds()
+        seconds = (to_utc(min(upcoming, key=to_utc)) - to_utc(now)).total_seconds()
         return max(float(MIN_WAIT_SECONDS), min(float(TICK_SECONDS), seconds))
