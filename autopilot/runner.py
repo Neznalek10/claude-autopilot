@@ -89,19 +89,21 @@ INSTALL_HINT = (
     "or set CLAUDE_BIN in .env to the full path of the claude binary."
 )
 
-# Matches the phrases Claude Code uses when the subscription's usage limit is hit,
-# e.g. "You've hit your session limit", "usage limit reached", "out of extra usage".
+# Matches only Claude's own wording for a subscription usage limit, e.g. "You've hit your
+# session limit", "Claude AI usage limit reached", "5-hour limit reached", "out of extra
+# usage". Deliberately not a bare "rate limit" or "limit exceeded": those come from other
+# tools a task runs (e.g. "gh: API rate limit exceeded") and must stay plain errors.
 RATE_LIMIT_RE = re.compile(
-    r"\b(usage|rate|session|weekly|5-hour|five-hour)[ -]limit\b"
-    r"|\blimit (reached|exceeded|hit)\b"
-    r"|\bhit your limit\b"
-    r"|\bout of (extra )?usage\b",
+    r"\b(usage|session|weekly|daily|5-hour|five-hour)[ -]limit\b"
+    r"|\bhit your (?:(?:session|weekly|usage) )?limit\b"
+    r"|\bout of (?:extra )?usage\b",
     re.IGNORECASE,
 )
 # Matches the machine-readable reset time "...limit reached|1760000000" (epoch seconds).
 RESET_EPOCH_RE = re.compile(r"\|(\d{10})\b")
-# An IANA zone name in parentheses right after the reset time, e.g. " (Europe/Prague)".
-RESET_ZONE_RE = re.compile(r"\s*\((?P<zone>[A-Za-z]+(?:/[A-Za-z0-9_+-]+)+)\)")
+# A zone name in parentheses right after the reset time: an IANA name such as
+# " (Europe/Prague)", or the slash-less " (UTC)" / " (GMT)".
+RESET_ZONE_RE = re.compile(r"\s*\((?P<zone>[A-Za-z]+(?:/[A-Za-z0-9_+-]+)+|UTC|GMT)\)")
 # Matches a human reset time such as "resets 5pm", "resets at 5:30 pm", "reset 17:00",
 # optionally preceded by a month and day ("resets Nov 7, 9am", "resets Nov 7 at 9:30am")
 # or by a weekday ("resets Thu 9am"), as weekly-limit messages are worded.
@@ -727,10 +729,14 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
     """
     _signal_group(process.pid, signal.SIGTERM)
     try:
-        process.wait(timeout=KILL_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        logger.warning("Claude did not stop after SIGTERM; sending SIGKILL to its process group")
-    _signal_group(process.pid, signal.SIGKILL)
+        try:
+            process.wait(timeout=KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.warning("Claude did not stop after SIGTERM; sending SIGKILL to its group")
+    finally:
+        # In a finally so a second Ctrl-C during the grace period can't skip the SIGKILL
+        # (a Claude that ignores SIGTERM would otherwise survive, with its children).
+        _signal_group(process.pid, signal.SIGKILL)
     process.wait()
 
 
@@ -873,14 +879,17 @@ class ClaudeRunner:
         for process in live:
             _signal_group(process.pid, signal.SIGTERM)
         deadline = time.monotonic() + KILL_GRACE_SECONDS
-        for process in live:
-            try:
-                process.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                logger.warning("Claude (pid %s) ignored SIGTERM; sending SIGKILL", process.pid)
-        # Always SIGKILL: a leader that exited may have left children that ignore SIGTERM.
-        for process in live:
-            _signal_group(process.pid, signal.SIGKILL)
+        try:
+            for process in live:
+                try:
+                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    logger.warning("Claude (pid %s) ignored SIGTERM; sending SIGKILL", process.pid)
+        finally:
+            # Always SIGKILL, even if the wait is interrupted: a leader that exited may have
+            # left children that ignore SIGTERM.
+            for process in live:
+                _signal_group(process.pid, signal.SIGKILL)
         return len(live)
 
     def _launch(

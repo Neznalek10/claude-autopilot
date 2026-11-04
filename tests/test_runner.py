@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from unittest import mock
@@ -349,8 +349,9 @@ class DetectRateLimitTests(unittest.TestCase):
             "5-hour limit reached",
             "Weekly limit exceeded",
             "You have hit your limit",
+            "You've hit your weekly limit",
+            "Daily limit reached",
             "You're out of extra usage",
-            "RATE LIMIT hit",
         ]
         for phrase in phrases:
             with self.subTest(phrase=phrase):
@@ -359,6 +360,18 @@ class DetectRateLimitTests(unittest.TestCase):
     def test_ordinary_text_is_not_a_limit(self) -> None:
         """Unrelated text, including empty text and Czech, is not a limit."""
         for text in ("", "All good", CZECH_SENTENCE, "unlimited usage"):
+            with self.subTest(text=text):
+                self.assertEqual(detect_rate_limit(text, NOW), (False, None))
+
+    def test_other_tools_rate_limits_are_not_claude_usage_limits(self) -> None:
+        """A rate-limit message from a tool the task ran (e.g. GitHub) is not a usage limit."""
+        texts = (
+            "gh api failed: API rate limit exceeded",
+            "Rate limit reached for requests",
+            "HTTP 403: rate limit hit, retry later",
+            "limit exceeded",
+        )
+        for text in texts:
             with self.subTest(text=text):
                 self.assertEqual(detect_rate_limit(text, NOW), (False, None))
 
@@ -420,11 +433,20 @@ class DetectRateLimitTests(unittest.TestCase):
         )
 
     def test_zone_named_in_the_message_wins_over_autopilot_zone(self) -> None:
-        """'resets 10:20pm (Europe/Prague)' means Prague time even when autopilot runs in New York."""
+        """'resets 10:20pm (Europe/Prague)' means Prague time even when autopilot runs elsewhere."""
         new_york_noon = datetime(2026, 11, 3, 12, 0, tzinfo=ZoneInfo("America/New_York"))
         text = "You've hit your session limit · resets 10:20pm (Europe/Prague)"
         reset = detect_rate_limit(text, new_york_noon)[1]
         self.assertEqual(reset, datetime(2026, 11, 3, 22, 22, tzinfo=ZoneInfo("Europe/Prague")))
+
+    def test_utc_and_gmt_count_as_zones(self) -> None:
+        """'(UTC)' and '(GMT)' after the time are read as those zones, not autopilot's zone."""
+        for name in ("UTC", "GMT"):
+            with self.subTest(zone=name):
+                text = f"You've hit your session limit · resets 10:20pm ({name})"
+                self.assertEqual(
+                    detect_rate_limit(text, NOW)[1], datetime(2026, 11, 2, 22, 22, tzinfo=UTC)
+                )
 
     def test_unknown_zone_name_falls_back_to_autopilot_zone(self) -> None:
         """A name that isn't a known zone is ignored; the time is read in the given now's zone."""
@@ -607,6 +629,16 @@ class ParseOutputTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, STATUS_RATE_LIMITED)
         self.assertIsNone(outcome.retry_at)
+
+    def test_other_tools_rate_limit_in_a_failed_result_is_a_plain_error(self) -> None:
+        """A failed run quoting 'API rate limit exceeded' stays an error, with no retry time."""
+        outcome = self.parse(
+            result_json(is_error=True, result="gh api failed: API rate limit exceeded"),
+            exit_code=1,
+        )
+        self.assertEqual(outcome.status, STATUS_ERROR)
+        raw = self.parse("", stderr="API rate limit exceeded", exit_code=1)
+        self.assertEqual(raw.status, STATUS_ERROR)
 
     def test_rate_limit_from_api_status_429(self) -> None:
         """api_error_status 429 marks a rate limit even without matching text."""
@@ -843,6 +875,34 @@ class ClaudeRunnerTests(unittest.TestCase):
             outcome = stubborn_runner.run("hi", self.options(timeout_seconds=1))
         self.assertEqual(outcome.status, STATUS_TIMEOUT)
         self.assert_no_leftover_processes()
+
+    def test_second_interrupt_during_grace_still_sends_sigkill(self) -> None:
+        """A Ctrl-C while waiting out the SIGTERM grace period can't skip the SIGKILL."""
+        ready = self.root / "ready"
+        stubborn = make_executable(
+            self.root / "stubborn.sh",
+            f"#!/bin/bash\ntrap '' TERM\nsleep 60 &\ntouch '{ready}'\nwait\n",
+        )
+        process = runner._start_process([str(stubborn)], self.options(), os.environ)
+        with process:
+            deadline = time.monotonic() + POLL_SECONDS
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(POLL_INTERVAL)
+            self.assertTrue(ready.exists(), "the stand-in did not start")
+            real_wait = subprocess.Popen.wait
+            interrupts = []
+
+            def interrupted_wait(popen, timeout=None):
+                """Raise KeyboardInterrupt on the first wait (the grace period), then behave."""
+                if not interrupts:
+                    interrupts.append(True)
+                    raise KeyboardInterrupt
+                return real_wait(popen, timeout)
+
+            with mock.patch.object(subprocess.Popen, "wait", interrupted_wait):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner._kill_process_group(process)
+            self.assert_no_leftover_processes()
 
     def test_keyboard_interrupt_kills_the_group_and_propagates(self) -> None:
         """An interrupt while waiting kills the process group and is re-raised."""
