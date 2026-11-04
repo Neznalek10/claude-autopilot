@@ -9,7 +9,7 @@ from __future__ import annotations
 import tempfile
 import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ from autopilot.bot import (
     TelegramNotifier,
 )
 from autopilot.errors import TaskNotFoundError, TelegramError
+from autopilot.formatting import TELEGRAM_MAX_CHARS
 from autopilot.models import (
     ASK_TASK_NAME,
     BOT_COMMANDS,
@@ -181,6 +182,19 @@ class NotifierTests(BotTestCase):
         self.notifier.notify_text("a <b> & c")
         self.assertIsNone(self.client.sent[0]["parse_mode"])
         self.assertEqual(self.client.sent[0]["text"], "a <b> & c")
+
+    def test_notify_text_truncates_long_text(self) -> None:
+        """A text over Telegram's limit is cut to fit and ends with a note."""
+        self.notifier.notify_text("x" * (TELEGRAM_MAX_CHARS + 500))
+        sent = self.client.sent[0]["text"]
+        self.assertEqual(len(sent), TELEGRAM_MAX_CHARS)
+        self.assertTrue(sent.endswith("…(truncated)"))
+
+    def test_notify_text_keeps_text_at_the_limit(self) -> None:
+        """A text exactly at the limit is sent unchanged."""
+        text = "y" * TELEGRAM_MAX_CHARS
+        self.notifier.notify_text(text)
+        self.assertEqual(self.client.sent[0]["text"], text)
 
     def test_send_html_falls_back_to_plain_on_parse_error(self) -> None:
         """A parse error resends the text without tags and without a parse mode."""
@@ -446,6 +460,18 @@ class ChatTests(BotTestCase):
         )
         self.assertEqual(self.client.chat_actions, [])
 
+    def test_chat_while_usage_limited_tells_the_reset_time(self) -> None:
+        """With the gate closed the user gets the local reset time instead of typing."""
+        until = datetime(2026, 11, 2, 12, 30, tzinfo=timezone.utc)
+        self.engine.snapshot_value = QueueSnapshot(running=(), queued=(), limited_until=until)
+        self.send("hello")
+        self.assertEqual(self.engine.methods(), ["enqueue_prompt"])
+        self.assertEqual(self.client.chat_actions, [])
+        self.assertEqual(
+            self.texts(),
+            ["⏳ Claude's usage limit is reached until 13:30. Your message is queued and I'll answer then."],
+        )
+
     def test_finished_runs_are_not_ahead(self) -> None:
         """Only queued or running runs count as ahead."""
         self.finish_run("news", "done")
@@ -593,6 +619,44 @@ class PollingTests(BotTestCase):
             self.bot.poll_forever(stop)
         self.assertEqual(seen, [None, "6"])
         self.assertEqual(self.store.get_value(OFFSET_KEY), "7")
+
+    def test_handler_failure_replies_and_still_stores_offset(self) -> None:
+        """A crashing handler gets a best-effort apology and the update is not replayed."""
+        stop = threading.Event()
+        self.engine.enqueue_prompt = self._raise_runtime  # type: ignore[method-assign]
+        self.client.updates = [[message_update("hello", update_id=8)]]
+        original_get = self.client.get_updates
+
+        def get_updates(offset: int | None = None, timeout: int = 50) -> list[dict[str, Any]]:
+            """Serve the scripted batch, then stop the loop on the next call."""
+            batch = original_get(offset, timeout)
+            if not batch:
+                stop.set()
+            return batch
+
+        self.client.get_updates = get_updates  # type: ignore[method-assign]
+        with self.assertLogs("autopilot.bot", level="ERROR"):
+            self.bot.poll_forever(stop)
+        self.assertEqual(self.texts(), ["⚠️ Something went wrong with that message. Please try again."])
+        self.assertEqual(self.store.get_value(OFFSET_KEY), "9")
+
+    def test_failed_apology_is_ignored(self) -> None:
+        """If the apology itself cannot be sent, the loop still stores the offset."""
+        self.engine.enqueue_prompt = self._raise_runtime  # type: ignore[method-assign]
+        self.client.send_message = self._raise_telegram  # type: ignore[method-assign]
+        with self.assertLogs("autopilot.bot", level="WARNING"):
+            self.bot._process(message_update("hello", update_id=3))
+        self.assertEqual(self.store.get_value(OFFSET_KEY), "4")
+
+    @staticmethod
+    def _raise_runtime(*args: Any, **kwargs: Any) -> int:
+        """Stand-in for an engine call that crashes."""
+        raise RuntimeError("boom")
+
+    @staticmethod
+    def _raise_telegram(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Stand-in for a send that fails with a non-retried API error."""
+        raise TelegramError("forbidden", status=403)
 
     def test_stored_offset_is_passed_to_get_updates(self) -> None:
         """A persisted offset is used for the next poll."""

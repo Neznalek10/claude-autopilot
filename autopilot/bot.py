@@ -30,6 +30,7 @@ from typing import Any, Protocol
 
 from autopilot.errors import TaskNotFoundError, TelegramError
 from autopilot.formatting import (
+    TELEGRAM_MAX_CHARS,
     escape_html,
     format_run_messages,
     format_status,
@@ -58,6 +59,8 @@ POLL_BACKOFF_MAX = 60
 SEND_RETRY_DEFAULT_SECONDS = 5
 SEND_RETRY_MAX_SECONDS = 30
 HTTP_TOO_MANY_REQUESTS = 429
+TRUNCATION_NOTE = "\n…(truncated)"
+REPLY_HANDLER_FAILED = "⚠️ Something went wrong with that message. Please try again."
 
 COMMAND_PREFIX = "/"
 BOT_NAME_SEPARATOR = "@"
@@ -238,6 +241,9 @@ class TelegramNotifier:
         Raises:
             TelegramError: If Telegram rejects the send.
         """
+        # Telegram rejects longer texts outright, which would lose the notice.
+        if len(text) > TELEGRAM_MAX_CHARS:
+            text = text[: TELEGRAM_MAX_CHARS - len(TRUNCATION_NOTE)] + TRUNCATION_NOTE
         self._send(self.client.send_message, self.chat_id, text, parse_mode=None)
 
     def send_html(self, html: str) -> dict[str, Any]:
@@ -399,6 +405,7 @@ class TelegramBot:
         # Broad on purpose: one bad update must never stop the polling loop.
         except Exception:
             logger.exception("Failed to handle Telegram update %s", update.get("update_id"))
+            self._reply_handler_failed()
         # Stored even after a failure: replaying a poison update would loop forever.
         update_id = update.get("update_id")
         if isinstance(update_id, int):
@@ -406,6 +413,13 @@ class TelegramBot:
             # asks Telegram for the next update instead of replaying this one.
             self._offset = update_id + 1
             self.store.set_value(OFFSET_KEY, str(self._offset))
+
+    def _reply_handler_failed(self) -> None:
+        """Tell the user their message failed; best effort, a failed reply is only logged."""
+        try:
+            self._reply(REPLY_HANDLER_FAILED)
+        except TelegramError as err:
+            logger.warning("Could not send the failure notice: %s", err)
 
     def _current_offset(self) -> int | None:
         """Return the in-memory offset, else the persisted one (None if absent or unreadable)."""
@@ -459,6 +473,15 @@ class TelegramBot:
         if ahead:
             self._reply(
                 f"🕐 Got it. {ahead} run(s) ahead of you, I'll answer when they finish."
+            )
+            return
+        limited_until = self.engine.snapshot().limited_until
+        if limited_until is not None:
+            # No answer will come until the reset, so say so instead of "typing".
+            local = limited_until.astimezone(self.clock().tzinfo)
+            self._reply(
+                f"⏳ Claude's usage limit is reached until {local:%H:%M}. "
+                "Your message is queued and I'll answer then."
             )
             return
         try:
