@@ -320,6 +320,40 @@ class ValidationTest(TaskConfigTestCase):
         self.assertConfigError({"task": {"name": "x"}}, "[[task]]")
         self.assertConfigError({"task": ["x"]}, "task #1", "table")
 
+    def test_every_error_is_listed_one_per_line_in_file_order(self) -> None:
+        """Errors in several tasks are all reported, not just the first."""
+        with self.assertRaises(ConfigError) as ctx:
+            self.parse({"task": [
+                self.task(name="a", model="-x"),
+                self.task(name="ok"),
+                self.task(name="b", schedule="nonsense"),
+                self.task(name="c", effort="extreme"),
+            ]})
+        lines = str(ctx.exception).split("\n")
+        self.assertEqual(len(lines), 3)
+        for line, (name, field) in zip(lines, (("a", "model"), ("b", "schedule"), ("c", "effort"))):
+            self.assertTrue(line.startswith(f"tasks.toml: task '{name}': "), line)
+            self.assertIn(f"'{field}'", line)
+
+    def test_defaults_ask_and_tasks_errors_are_combined(self) -> None:
+        """A bad default is listed once, then [ask] and task errors follow."""
+        with self.assertRaises(ConfigError) as ctx:
+            self.parse({
+                "defaults": {"effort": "extreme"},
+                "ask": {"timeout_minutes": 0},
+                "task": [self.task(), self.task(name="b", notify="x")],
+            })
+        lines = str(ctx.exception).split("\n")
+        self.assertEqual(len(lines), 3)
+        self.assertIn("[defaults]", lines[0])
+        self.assertIn("[ask]", lines[1])
+        self.assertIn("task 'b'", lines[2])
+
+    def test_single_error_keeps_its_type(self) -> None:
+        """One bad schedule still raises ScheduleError."""
+        with self.assertRaises(ScheduleError):
+            self.parse({"task": [self.task(), self.task(name="b", schedule="nonsense")]})
+
     def test_source_is_stored(self) -> None:
         """The source argument ends up on the config."""
         source = self.base / "tasks.toml"
@@ -356,6 +390,12 @@ class LoadTaskConfigTest(TaskConfigTestCase):
             load_task_config(path)
         self.assertIn("line 2", str(ctx.exception))
         self.assertIn("column", str(ctx.exception))
+
+    def test_utf8_bom_is_accepted(self) -> None:
+        """A file saved with a byte order mark loads."""
+        path = self.base / "tasks.toml"
+        path.write_bytes(b"\xef\xbb\xbf" + b'[[task]]\nname = "a"\nprompt = "p"\n')
+        self.assertIn("a", load_task_config(path).tasks)
 
     def test_invalid_utf8(self) -> None:
         """Undecodable bytes are a ConfigError, not a crash."""

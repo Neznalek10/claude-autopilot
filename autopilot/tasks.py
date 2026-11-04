@@ -402,6 +402,52 @@ def _parse_task(
     return task
 
 
+def _validate_defaults(defaults: Mapping[str, Any], base_dir: Path, protected_rules: tuple[str, ...]) -> None:
+    """Check every value in ``[defaults]`` (options and behaviour keys).
+
+    Raises:
+        ConfigError: On the first invalid value, labelled ``[defaults]``.
+    """
+    _build_options(defaults, DEFAULTS_LABEL, base_dir, DEFAULT_TIMEOUT_MINUTES, protected_rules)
+    _optional(defaults, "notify", lambda v: _parse_choice(v, DEFAULTS_LABEL, "notify", NOTIFY_POLICIES))
+    _optional(defaults, "enabled", lambda v: _parse_bool(v, DEFAULTS_LABEL, "enabled"))
+
+
+def _parse_entry(entry: Any, index: int, *args: Any) -> Task:
+    """Check that a ``[[task]]`` entry is a table, then validate it with ``_parse_task``.
+
+    Raises:
+        ConfigError: If the entry is not a table or any field is invalid.
+    """
+    table = _as_table(entry, f"tasks.toml: task #{index}: ", "each [[task]] entry")
+    return _parse_task(table, index, *args)
+
+
+def _capture(errors: list[ConfigError], step: Callable[..., Any], *args: Any) -> Any:
+    """Run ``step(*args)``; on ConfigError record it in ``errors`` and return that error.
+
+    The caller tells success from failure with ``isinstance(result, ConfigError)``, so
+    steps must not return ConfigError objects themselves.
+    """
+    try:
+        return step(*args)
+    except ConfigError as err:
+        errors.append(err)
+        return err
+
+
+def _raise_collected(errors: list[ConfigError]) -> None:
+    """Raise the collected errors: the original when there is one, else one joined ConfigError.
+
+    Keeping the single original preserves its type (e.g. ScheduleError); several are
+    listed one per line in file order.
+    """
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise ConfigError("\n".join(str(err) for err in errors))
+
+
 def parse_task_config(
     data: Mapping[str, Any],
     base_dir: Path,
@@ -424,8 +470,10 @@ def parse_task_config(
         The validated config with tasks in file order.
 
     Raises:
-        ConfigError: On the first problem found; the message names the task
-            and the field. ScheduleError (a ConfigError) for bad schedules.
+        ConfigError: When anything is invalid. The message lists every problem,
+            one per line in file order (one per table: [defaults], [ask], each
+            task), each naming the task and the field. A single problem is
+            raised as is (ScheduleError for a bad schedule).
 
     Example:
         >>> config = parse_task_config(
@@ -441,29 +489,41 @@ def parse_task_config(
     _check_keys(defaults, DEFAULTS_KEYS, DEFAULTS_LABEL)
     _check_keys(ask, ASK_KEYS, ASK_LABEL)
 
-    # Validate [defaults] on its own so a bad default is blamed on [defaults], not on every task.
-    protected_rules = _protected_rules(protected_paths)
-    _build_options(defaults, DEFAULTS_LABEL, base_dir, DEFAULT_TIMEOUT_MINUTES, protected_rules)
-    _optional(defaults, "notify", lambda v: _parse_choice(v, DEFAULTS_LABEL, "notify", NOTIFY_POLICIES))
-    _optional(defaults, "enabled", lambda v: _parse_bool(v, DEFAULTS_LABEL, "enabled"))
-
-    # Ask options inherit the option keys from [defaults] but keep their own timeout default.
-    default_options = {key: value for key, value in defaults.items() if key in OPTION_KEYS}
-    ask_options = _build_options(
-        {**default_options, **ask}, ASK_LABEL, base_dir, DEFAULT_ASK_TIMEOUT_MINUTES, protected_rules
-    )
-
     raw_tasks = data.get("task", [])
     if not isinstance(raw_tasks, list):
         raise _fail("tasks.toml: ", "'task' must be an array of tables written as [[task]].")
+
+    # Each table is checked independently and its first error is kept, so one run reports
+    # a problem per table (defaults, ask, every task) in file order.
+    errors: list[ConfigError] = []
+    protected_rules = _protected_rules(protected_paths)
+
+    # Validate [defaults] on its own so a bad default is blamed on [defaults], not on every task.
+    defaults_error = _capture(errors, _validate_defaults, defaults, base_dir, protected_rules)
+    # A broken [defaults] is not inherited: the error is already listed and would repeat everywhere.
+    inherited = {} if defaults_error else defaults
+
+    # Ask options inherit the option keys from [defaults] but keep their own timeout default.
+    default_options = {key: value for key, value in inherited.items() if key in OPTION_KEYS}
+    ask_options = _capture(
+        errors,
+        _build_options,
+        {**default_options, **ask},
+        ASK_LABEL,
+        base_dir,
+        DEFAULT_ASK_TIMEOUT_MINUTES,
+        protected_rules,
+    )
 
     now = datetime.now(timezone.utc)
     tasks: dict[str, Task] = {}
     seen: set[str] = set()
     for index, entry in enumerate(raw_tasks, start=1):
-        table = _as_table(entry, f"tasks.toml: task #{index}: ", "each [[task]] entry")
-        task = _parse_task(table, index, defaults, base_dir, seen, now, protected_rules)
-        tasks[task.name] = task
+        task = _capture(errors, _parse_entry, entry, index, inherited, base_dir, seen, now, protected_rules)
+        if isinstance(task, Task):
+            tasks[task.name] = task
+
+    _raise_collected(errors)
     return TaskConfig(tasks=tasks, ask_options=ask_options, source=source)
 
 
@@ -487,7 +547,8 @@ def load_task_config(path: Path, *, protected_paths: Sequence[Path] = ()) -> Tas
     if not path.is_file():
         raise ConfigError(f"tasks.toml not found at {path}. Run `autopilot init` to create one.")
     try:
-        text = path.read_text(encoding="utf-8")
+        # utf-8-sig drops the byte order mark some Windows editors add.
+        text = path.read_text(encoding="utf-8-sig")
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as err:
         # tomllib's message already ends with "(at line L, column C)".
