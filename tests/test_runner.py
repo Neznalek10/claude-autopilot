@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from unittest import mock
 
@@ -417,6 +418,18 @@ class DetectRateLimitTests(unittest.TestCase):
         self.assertEqual(
             detect_rate_limit(text, NOW)[1], datetime(2026, 11, 2, 22, 22, tzinfo=TZ)
         )
+
+    def test_zone_named_in_the_message_wins_over_autopilot_zone(self) -> None:
+        """'resets 10:20pm (Europe/Prague)' means Prague time even when autopilot runs in New York."""
+        new_york_noon = datetime(2026, 11, 3, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        text = "You've hit your session limit · resets 10:20pm (Europe/Prague)"
+        reset = detect_rate_limit(text, new_york_noon)[1]
+        self.assertEqual(reset, datetime(2026, 11, 3, 22, 22, tzinfo=ZoneInfo("Europe/Prague")))
+
+    def test_unknown_zone_name_falls_back_to_autopilot_zone(self) -> None:
+        """A name that isn't a known zone is ignored; the time is read in the given now's zone."""
+        text = "usage limit reached, resets 5pm (Mars/Olympus_Base)"
+        self.assertEqual(detect_rate_limit(text, NOW)[1], datetime(2026, 11, 2, 17, 2, tzinfo=TZ))
 
     def test_month_and_day_before_the_time(self) -> None:
         """'resets Nov 7, 9am' and 'resets Nov 7 at 9:30am' read the named date."""

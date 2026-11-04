@@ -37,6 +37,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, time as day_time, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,8 @@ RATE_LIMIT_RE = re.compile(
 )
 # Matches the machine-readable reset time "...limit reached|1760000000" (epoch seconds).
 RESET_EPOCH_RE = re.compile(r"\|(\d{10})\b")
+# An IANA zone name in parentheses right after the reset time, e.g. " (Europe/Prague)".
+RESET_ZONE_RE = re.compile(r"\s*\((?P<zone>[A-Za-z]+(?:/[A-Za-z0-9_+-]+)+)\)")
 # Matches a human reset time such as "resets 5pm", "resets at 5:30 pm", "reset 17:00",
 # optionally preceded by a month and day ("resets Nov 7, 9am", "resets Nov 7 at 9:30am")
 # or by a weekday ("resets Thu 9am"), as weekly-limit messages are worded.
@@ -448,6 +451,26 @@ def _next_wall_time(match: re.Match[str], now: datetime) -> datetime | None:
     return None
 
 
+def _zone_after(text: str, position: int) -> ZoneInfo | None:
+    """Read the zone name that Claude prints after a reset time, if it is a known zone.
+
+    Args:
+        text: Output of a limited run.
+        position: Index just after the reset time.
+
+    Returns:
+        The named zone, or None when no known zone name follows.
+    """
+    match = RESET_ZONE_RE.match(text, position)
+    if match is None:
+        return None
+    try:
+        return ZoneInfo(match.group("zone"))
+    except (ZoneInfoNotFoundError, ValueError):
+        # An unknown or malformed name: fall back to autopilot's own zone.
+        return None
+
+
 def _parse_reset_time(text: str, now: datetime) -> datetime | None:
     """Find the usage-limit reset moment in ``text`` (without the safety buffer).
 
@@ -464,7 +487,10 @@ def _parse_reset_time(text: str, now: datetime) -> datetime | None:
         return datetime.fromtimestamp(int(epoch_match.group(1)), tz=now.tzinfo)
     clock_match = RESET_CLOCK_RE.search(text)
     if clock_match:
-        return _next_wall_time(clock_match, now)
+        # Claude names the zone its wall time refers to; read the time there when
+        # autopilot itself runs in another zone (AUTOPILOT_TIMEZONE).
+        zone = _zone_after(text, clock_match.end())
+        return _next_wall_time(clock_match, now.astimezone(zone) if zone else now)
     return None
 
 
