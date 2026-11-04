@@ -37,6 +37,7 @@ from autopilot.engine import (
 from autopilot.errors import ConfigError, TaskNotFoundError
 from autopilot.models import (
     ASK_TASK_NAME,
+    DEFAULT_TIMEOUT_SECONDS,
     NOTIFY_ALWAYS,
     NOTIFY_ERRORS,
     NOTIFY_NEVER,
@@ -1221,6 +1222,125 @@ class StoppingTests(EngineTestCase):
         self.assertIsNone(record.retry_at)
         self.assertIsNone(self.store.get_value(LIMITED_UNTIL_KEY))
         self.assertEqual(self.notifier.texts, [])
+
+
+class ShutdownSignalTests(EngineTestCase):
+    """A KeyboardInterrupt or SystemExit during the Claude call must not leave the run "running"."""
+
+    def test_interrupt_finishes_the_run_as_interrupted_and_reraises(self) -> None:
+        """Ctrl-C is recorded (no notification) and still propagates, and the task is free again."""
+        for signal_exception in (KeyboardInterrupt(), SystemExit(143)):
+            with self.subTest(signal=type(signal_exception).__name__):
+                self.notifier.runs.clear()
+                run_id = self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False)
+                self.runner.queue(signal_exception)
+                with self.assertRaises(type(signal_exception)):
+                    self.engine.execute_run(run_id)
+                record = self.store.get_run(run_id)
+                self.assertEqual((record.status, record.error), (STATUS_ERROR, INTERRUPTED_MESSAGE))
+                self.assertEqual(record.finished_at, self.clock())
+                self.assertEqual(self.notifier.runs, [])
+                self.assertEqual(self.store.active_runs(), [])
+
+    def test_interrupted_chat_turn_keeps_the_conversation_and_releases_the_lock(self) -> None:
+        """An interrupted resumed turn leaves the session alone and does not deadlock later turns."""
+        self.runner.queue(success(session_id="s1"), KeyboardInterrupt(), success(session_id="s1"))
+        self.chat()
+        run_id = self.engine.enqueue_prompt("second", dispatch=False)
+        with self.assertRaises(KeyboardInterrupt):
+            self.engine.execute_run(run_id)
+        self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "s1")
+        self.assertEqual(self.chat().status, STATUS_SUCCESS)
+        self.assertEqual(self.runner.calls[2].resume_session, "s1")
+
+
+class StaleRunTests(EngineTestCase):
+    """tick() finishes runs abandoned in "running" by a process that died without cleanup."""
+
+    def start_stale_run(self, task_name: str = "news", trigger: str = TRIGGER_MANUAL) -> int:
+        """Create a run that started at START and never finished.
+
+        Args:
+            task_name: Task (or ask) name of the run.
+            trigger: Trigger of the run.
+
+        Returns:
+            The run id.
+        """
+        run_id = self.store.create_run(task_name=task_name, trigger=trigger, prompt="p", queued_at=START)
+        self.store.mark_running(run_id, START)
+        return run_id
+
+    def test_swept_only_after_timeout_plus_grace(self) -> None:
+        """A run is left alone up to timeout + 5 minutes, then marked interrupted without a notice."""
+        run_id = self.start_stale_run()
+        limit = timedelta(seconds=self.news.options.timeout_seconds + 5 * 60)
+        self.clock.set(START + limit)
+        self.engine.tick()
+        self.assertEqual(self.store.get_run(run_id).status, STATUS_RUNNING)
+        self.clock.advance(seconds=1)
+        with self.assertLogs("autopilot.engine", level="WARNING"):
+            self.engine.tick()
+        record = self.store.get_run(run_id)
+        self.assertEqual((record.status, record.error), (STATUS_ERROR, INTERRUPTED_MESSAGE))
+        self.assertEqual(record.finished_at, self.clock())
+        self.assertEqual((self.notifier.runs, self.notifier.texts), ([], []))
+
+    def test_swept_task_can_be_queued_again(self) -> None:
+        """Once the stale row is cleared, deduplication no longer blocks the task."""
+        self.start_stale_run()
+        self.assertIsNone(self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False))
+        self.clock.set(START + timedelta(hours=1))
+        self.engine.tick()
+        self.assertIsNotNone(self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False))
+
+    def test_uses_the_timeout_of_the_current_task(self) -> None:
+        """A task with a short timeout is swept sooner than the default."""
+        self.set_tasks(make_task("news", "p", (), options=make_options(timeout_seconds=60)))
+        run_id = self.start_stale_run()
+        self.clock.set(START + timedelta(minutes=6, seconds=1))
+        self.engine.tick()
+        self.assertEqual(self.store.get_run(run_id).error, INTERRUPTED_MESSAGE)
+
+    def test_ask_runs_use_the_ask_timeout(self) -> None:
+        """Chat and ask runs are judged by the [ask] timeout, not a task's."""
+        self.ask_options = make_options(timeout_seconds=120)
+        self.set_tasks(self.news)
+        run_id = self.start_stale_run(ASK_TASK_NAME, TRIGGER_CHAT)
+        self.clock.set(START + timedelta(minutes=7) + timedelta(seconds=1))
+        self.engine.tick()
+        self.assertEqual(self.store.get_run(run_id).error, INTERRUPTED_MESSAGE)
+
+    def test_removed_task_uses_the_default_timeout(self) -> None:
+        """A run of a task that left tasks.toml is swept after DEFAULT_TIMEOUT_SECONDS + 5 minutes."""
+        run_id = self.start_stale_run("gone")
+        limit = timedelta(seconds=DEFAULT_TIMEOUT_SECONDS + 5 * 60)
+        self.clock.set(START + limit)
+        self.engine.tick()
+        self.assertEqual(self.store.get_run(run_id).status, STATUS_RUNNING)
+        self.clock.advance(seconds=1)
+        self.engine.tick()
+        self.assertEqual(self.store.get_run(run_id).error, INTERRUPTED_MESSAGE)
+
+    def test_queued_and_fresh_runs_are_left_alone(self) -> None:
+        """Only long-running rows are swept; queued runs and recent runs are untouched."""
+        queued = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        self.clock.set(START + timedelta(days=1))
+        fresh = self.store.create_run(task_name="plan", trigger=TRIGGER_MANUAL, prompt="p", queued_at=self.clock())
+        self.store.mark_running(fresh, self.clock())
+        self.engine.tick()
+        self.assertEqual(self.store.get_run(queued).status, STATUS_QUEUED)
+        self.assertEqual(self.store.get_run(fresh).status, STATUS_RUNNING)
+
+    def test_sweep_frees_the_task_for_its_schedule_in_the_same_tick(self) -> None:
+        """A due slot is queued in the same tick that clears the stale run blocking it."""
+        self.start_stale_run()
+        later = START + timedelta(days=1, minutes=1)
+        self.store.set_last_scheduled("news", START)
+        self.clock.set(later)
+        ids = self.engine.tick()
+        self.assertEqual(len(ids), 1)
+        self.assertEqual(self.store.get_run(ids[0]).trigger, TRIGGER_SCHEDULE)
 
 
 class InformationTests(EngineTestCase):

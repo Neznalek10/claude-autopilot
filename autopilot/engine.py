@@ -38,6 +38,7 @@ from autopilot.errors import ConfigError, TaskNotFoundError
 from autopilot.models import (
     ASK_TASK_NAME,
     CHAT_IDLE_HOURS,
+    DEFAULT_TIMEOUT_SECONDS,
     NOTIFY_ALWAYS,
     NOTIFY_ERRORS,
     NOTIFY_NEVER,
@@ -74,6 +75,8 @@ CHAT_IDLE_RESET = timedelta(hours=CHAT_IDLE_HOURS)
 # Time formats: "HH:MM" in user notices, a full date and time in log lines.
 CLOCK_TIME_FORMAT = "%H:%M"
 LOG_SLOT_TIME_FORMAT = "%Y-%m-%d %H:%M"
+# A run still "running" this long after its timeout was abandoned by a dead process.
+STALE_RUN_GRACE = timedelta(minutes=5)
 # How long stop() waits for workers to finish their current run before giving up on them.
 WORKER_JOIN_SECONDS = 5
 
@@ -419,7 +422,7 @@ class Engine:
     # ------------------------------------------------------------------- tick
 
     def tick(self) -> list[int]:
-        """Reload the configuration, queue due scheduled runs and due retries.
+        """Reload the configuration, clear abandoned runs, queue due runs and due retries.
 
         An exception while handling one task or retry is logged and does not
         stop the others.
@@ -429,6 +432,8 @@ class Engine:
         """
         now = self._clock()
         self.reload_if_changed()
+        # Before scheduling, so a task freed by the sweep can be queued in this same tick.
+        self._finish_stale_runs(now)
         new_ids: list[int] = []
         for name in list(self.config.tasks):
             try:
@@ -441,6 +446,41 @@ class Engine:
                 new_ids.append(run_id)
         new_ids.extend(self._queue_due_retries(now))
         return new_ids
+
+    def _finish_stale_runs(self, now: datetime) -> None:
+        """Finish runs stuck in ``running`` long past their timeout as interrupted.
+
+        A process killed without cleanup (``kill -9`` on a CLI run) leaves its
+        row ``running``, which would block the task through deduplication. The
+        runner enforces each run's timeout, so a run older than the timeout
+        plus STALE_RUN_GRACE cannot still be alive.
+
+        Args:
+            now: The current moment.
+        """
+        for record in self._store.active_runs():
+            if record.status != STATUS_RUNNING or record.started_at is None:
+                continue
+            limit = timedelta(seconds=self._timeout_seconds(record)) + STALE_RUN_GRACE
+            if to_utc(now) - to_utc(record.started_at) > limit:
+                logger.warning("Run #%d (%s) has been running too long, marking it interrupted",
+                               record.id, record.task_name)
+                self._store.finish_run(
+                    record.id, status=STATUS_ERROR, finished_at=now, error=INTERRUPTED_MESSAGE
+                )
+
+    def _timeout_seconds(self, record: RunRecord) -> int:
+        """Look up the timeout a run was started with, from the current configuration.
+
+        Args:
+            record: A run.
+
+        Returns:
+            The ask timeout for ask-name runs, the task's timeout for task runs, or
+            DEFAULT_TIMEOUT_SECONDS when the task no longer exists.
+        """
+        options = self._options_for(record)
+        return DEFAULT_TIMEOUT_SECONDS if options is None else options.timeout_seconds
 
     def _tick_task(self, name: str, now: datetime) -> int | None:
         """Evaluate one task's schedule and queue its due slot.
@@ -687,6 +727,8 @@ class Engine:
     ) -> RunOutcome:
         """Call the runner, turning an unexpected exception into an error outcome.
 
+        A BaseException (shutdown signal) finishes the run as interrupted and is re-raised.
+
         Args:
             record: The run being executed.
             options: Options for the Claude call.
@@ -694,6 +736,9 @@ class Engine:
 
         Returns:
             The runner's outcome, or an error outcome carrying the exception message.
+
+        Raises:
+            BaseException: KeyboardInterrupt, SystemExit and the like, after the run is recorded.
         """
         try:
             return self._runner.run(record.prompt, options, resume_session)
@@ -701,6 +746,11 @@ class Engine:
         except Exception as err:
             logger.exception("Run #%d crashed", record.id)
             return RunOutcome(status=STATUS_ERROR, error=str(err) or type(err).__name__)
+        except BaseException:
+            # KeyboardInterrupt or SystemExit (Ctrl-C, SIGTERM): record the run as interrupted so it
+            # does not stay "running" and block its task, then let the shutdown continue.
+            self._finish_interrupted(record, self._clock())
+            raise
 
     def _store_outcome(
         self, run_id: int, outcome: RunOutcome, finished_at: datetime, *, retry_at: datetime | None = None
