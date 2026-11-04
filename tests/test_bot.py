@@ -206,6 +206,106 @@ class NotifierTests(BotTestCase):
             notifier.send_html("hi")
 
 
+class FlakyClient(FakeTelegramClient):
+    """Client whose next sends raise the queued errors, then behave normally."""
+
+    def __init__(self, errors: list[TelegramError]) -> None:
+        """Queue the errors to raise, one per send_message or send_document call."""
+        super().__init__()
+        self.errors = errors
+        self.attempts = 0
+
+    def send_message(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Raise the next queued error, if any, else record the message."""
+        self.attempts += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return super().send_message(*args, **kwargs)
+
+    def send_document(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Raise the next queued error, if any, else record the document."""
+        self.attempts += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return super().send_document(*args, **kwargs)
+
+
+class RetryTests(unittest.TestCase):
+    """TelegramNotifier retries one transient send failure."""
+
+    def build(self, errors: list[TelegramError]) -> tuple[TelegramNotifier, FlakyClient, list[float]]:
+        """Build a notifier over a flaky client with a recording sleep."""
+        client = FlakyClient(errors)
+        sleeps: list[float] = []
+        return TelegramNotifier(client, CHAT_ID, sleep=sleeps.append), client, sleeps
+
+    def test_network_error_is_retried_once(self) -> None:
+        """A network failure (no status) is retried after 5 s and then delivered."""
+        notifier, client, sleeps = self.build([TelegramError("network error")])
+        with self.assertLogs("autopilot.bot", level="WARNING"):
+            notifier.notify_text("hi")
+        self.assertEqual(sleeps, [5])
+        self.assertEqual(len(client.sent), 1)
+
+    def test_rate_limit_waits_retry_after_capped(self) -> None:
+        """A 429 waits retry_after, capped at 30 s."""
+        notifier, client, sleeps = self.build([TelegramError("slow", status=429, retry_after=120)])
+        with self.assertLogs("autopilot.bot", level="WARNING"):
+            notifier.notify_text("hi")
+        self.assertEqual(sleeps, [30])
+        self.assertEqual(len(client.sent), 1)
+
+    def test_rate_limit_without_retry_after_uses_default(self) -> None:
+        """A 429 without retry_after waits the 5 s default."""
+        notifier, _, sleeps = self.build([TelegramError("slow", status=429)])
+        with self.assertLogs("autopilot.bot", level="WARNING"):
+            notifier.notify_text("hi")
+        self.assertEqual(sleeps, [5])
+
+    def test_api_error_is_not_retried(self) -> None:
+        """A 403 fails immediately without a second attempt or a sleep."""
+        notifier, client, sleeps = self.build([TelegramError("forbidden", status=403)])
+        with self.assertRaises(TelegramError):
+            notifier.notify_text("hi")
+        self.assertEqual((client.attempts, sleeps), (1, []))
+
+    def test_second_failure_propagates(self) -> None:
+        """Only one retry happens; a second failure reaches the caller."""
+        notifier, client, _ = self.build([TelegramError("down"), TelegramError("down")])
+        with self.assertLogs("autopilot.bot", level="WARNING"), self.assertRaises(TelegramError):
+            notifier.notify_text("hi")
+        self.assertEqual(client.attempts, 2)
+
+    def test_document_is_retried(self) -> None:
+        """The result file upload gets the same single retry."""
+        notifier, client, sleeps = self.build([])
+        long_result = "\n\n".join(f"P{i} " + "x" * 3000 for i in range(8))
+        client.errors = []
+        original = client.send_document
+        failed: list[bool] = []
+
+        def flaky_document(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            """Fail the first upload with a network error."""
+            if not failed:
+                failed.append(True)
+                raise TelegramError("network error")
+            return original(*args, **kwargs)
+
+        client.send_document = flaky_document  # type: ignore[method-assign]
+        with self.assertLogs("autopilot.bot", level="WARNING"):
+            notifier.notify_run(make_record(result=long_result))
+        self.assertEqual(sleeps, [5])
+        self.assertEqual(len(client.documents), 1)
+
+    def test_parse_error_fallback_still_works(self) -> None:
+        """A parse error is resent as plain text without any sleep."""
+        notifier, client, sleeps = self.build([TelegramError("Bad Request: can't parse entities", status=400)])
+        with self.assertLogs("autopilot.bot", level="WARNING"):
+            notifier.send_html("<b>x</b>")
+        self.assertEqual(sleeps, [])
+        self.assertEqual(client.sent[0]["text"], "x")
+
+
 class CommandTests(BotTestCase):
     """Every command and its replies."""
 
@@ -551,6 +651,52 @@ class PollingTests(BotTestCase):
         stop.set()
         with self.assertLogs("autopilot.bot", level="WARNING"):
             self.bot.poll_forever(stop)
+
+    def test_store_error_does_not_end_polling(self) -> None:
+        """A transient store error is logged, backed off, and polling resumes."""
+        waits = StopAfterWaits(5)
+        real_get = self.store.get_value
+        calls: list[int] = []
+
+        def flaky_get(key: str) -> str | None:
+            """Fail the first read like a locked database, then work."""
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("database is locked")
+            waits.set()
+            return real_get(key)
+
+        self.store.get_value = flaky_get  # type: ignore[method-assign]
+        with self.assertLogs("autopilot.bot", level="WARNING"):
+            self.bot.poll_forever(waits)
+        self.assertEqual(waits.delays, [POLL_BACKOFF_START])
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_offset_write_failure_does_not_replay_update(self) -> None:
+        """If storing the offset fails, the next poll still asks past that update."""
+        stop = StopAfterWaits(99)
+        offsets: list[int | None] = []
+        handled: list[int] = []
+        batches = [[message_update("a", update_id=5)]]
+
+        def get_updates(offset: int | None = None, timeout: int = 50) -> list[dict[str, Any]]:
+            """Record the requested offset and serve the scripted batches."""
+            offsets.append(offset)
+            if len(offsets) == 2:
+                stop.set()
+            return batches.pop(0) if batches else []
+
+        def failing_set(key: str, value: str | None) -> None:
+            """Fail like a locked database."""
+            raise RuntimeError("database is locked")
+
+        self.client.get_updates = get_updates  # type: ignore[method-assign]
+        self.bot.handle_update = lambda update: handled.append(update["update_id"])  # type: ignore[method-assign]
+        self.store.set_value = failing_set  # type: ignore[method-assign]
+        with self.assertLogs("autopilot.bot", level="WARNING"):
+            self.bot.poll_forever(stop)
+        self.assertEqual(handled, [5])
+        self.assertEqual(offsets[1], 6)
 
     def test_unreadable_stored_offset_is_ignored(self) -> None:
         """A corrupt offset value falls back to no offset."""

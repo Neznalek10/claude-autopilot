@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, tzinfo
 from typing import Any, Protocol
@@ -54,6 +55,9 @@ logger = logging.getLogger(__name__)
 OFFSET_KEY = "telegram_offset"
 POLL_BACKOFF_START = 5
 POLL_BACKOFF_MAX = 60
+SEND_RETRY_DEFAULT_SECONDS = 5
+SEND_RETRY_MAX_SECONDS = 30
+HTTP_TOO_MANY_REQUESTS = 429
 
 COMMAND_PREFIX = "/"
 BOT_NAME_SEPARATOR = "@"
@@ -158,7 +162,12 @@ class TelegramNotifier:
     """
 
     def __init__(
-        self, client: TelegramClient, chat_id: int, *, local_tz: tzinfo | None = None
+        self,
+        client: TelegramClient,
+        chat_id: int,
+        *,
+        local_tz: tzinfo | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         """Store the client and destination.
 
@@ -167,10 +176,42 @@ class TelegramNotifier:
             chat_id: The only chat that receives messages (may be negative).
             local_tz: Zone used for times in result documents; None keeps the
                 record's own offset.
+            sleep: Pause function used before a send is retried; tests pass a
+                recorder so nothing really sleeps.
         """
         self.client = client
         self.chat_id = chat_id
         self.local_tz = local_tz
+        self._sleep = sleep
+
+    def _send(self, send: Callable[..., dict[str, Any]], *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Call a client send method, retrying once after a transient failure.
+
+        Args:
+            send: ``client.send_message`` or ``client.send_document``.
+            *args: Positional arguments for ``send``.
+            **kwargs: Keyword arguments for ``send``.
+
+        Returns:
+            The API result.
+
+        Raises:
+            TelegramError: For errors that are not transient, or when the
+                single retry fails too.
+        """
+        try:
+            return send(*args, **kwargs)
+        except TelegramError as err:
+            # Network failures (no status) and rate limits are worth one more try;
+            # other API errors (bad request, forbidden) would fail the same way.
+            if err.status is not None and err.status != HTTP_TOO_MANY_REQUESTS:
+                raise
+            delay = SEND_RETRY_DEFAULT_SECONDS
+            if err.status == HTTP_TOO_MANY_REQUESTS and err.retry_after:
+                delay = min(err.retry_after, SEND_RETRY_MAX_SECONDS)
+            logger.warning("Telegram send failed, retrying once in %s s: %s", delay, err)
+            self._sleep(delay)
+            return send(*args, **kwargs)
 
     def notify_run(self, record: RunRecord) -> None:
         """Send a finished run: its messages in order, then a file if needed.
@@ -186,7 +227,7 @@ class TelegramNotifier:
             self.send_html(message)
         if needs_document:
             filename, content = result_document(record, local_tz=self.local_tz)
-            self.client.send_document(self.chat_id, filename, content)
+            self._send(self.client.send_document, self.chat_id, filename, content)
 
     def notify_text(self, text: str) -> None:
         """Send a plain-text notice (no formatting is interpreted).
@@ -197,7 +238,7 @@ class TelegramNotifier:
         Raises:
             TelegramError: If Telegram rejects the send.
         """
-        self.client.send_message(self.chat_id, text, parse_mode=None)
+        self._send(self.client.send_message, self.chat_id, text, parse_mode=None)
 
     def send_html(self, html: str) -> dict[str, Any]:
         """Send HTML, falling back to plain text if Telegram can't parse it.
@@ -213,13 +254,15 @@ class TelegramNotifier:
                 the plain-text resend fails too.
         """
         try:
-            return self.client.send_message(self.chat_id, html)
+            return self._send(self.client.send_message, self.chat_id, html)
         except TelegramError as err:
             if not is_parse_error(err):
                 raise
             # Telegram refused the markup; the text is still worth delivering.
             logger.warning("Telegram could not parse an HTML message, resending as plain text")
-            return self.client.send_message(self.chat_id, html_to_plain(html), parse_mode=None)
+            return self._send(
+                self.client.send_message, self.chat_id, html_to_plain(html), parse_mode=None
+            )
 
 
 class TelegramBot:
@@ -251,6 +294,7 @@ class TelegramBot:
         self.notifier = notifier
         self.chat_id = chat_id
         self.clock = clock
+        self._offset: int | None = None
         self._handlers: dict[str, Callable[[str], None]] = {
             "start": self._cmd_help,
             "help": self._cmd_help,
@@ -314,7 +358,8 @@ class TelegramBot:
 
         Registers the command menu once, then fetches updates starting at the
         stored offset, handles each one and stores ``update_id + 1`` after it.
-        Telegram errors back off from 5 to 60 seconds (``retry_after`` wins).
+        Any error in a cycle (Telegram or store) is logged and backs off from 5
+        to 60 seconds (``retry_after`` wins); polling then continues.
 
         Args:
             stop: Set by the service to end the loop; also used for the
@@ -327,16 +372,25 @@ class TelegramBot:
         backoff = POLL_BACKOFF_START
         while not stop.is_set():
             try:
-                updates = self.client.get_updates(offset=self._stored_offset())
-            except TelegramError as err:
-                delay = err.retry_after if err.retry_after else backoff
-                logger.warning("Telegram polling failed, retrying in %s s: %s", delay, err)
+                self._poll_once()
+            # Broad on purpose: a transient store or parsing error must not end the
+            # bot thread while the engine keeps running with nobody listening.
+            except Exception as err:
+                retry_after = err.retry_after if isinstance(err, TelegramError) else None
+                delay = retry_after or backoff
+                logger.warning(
+                    "Telegram polling failed, retrying in %s s: %s", delay, err,
+                    exc_info=not isinstance(err, TelegramError),
+                )
                 backoff = min(backoff * 2, POLL_BACKOFF_MAX)
                 stop.wait(delay)
                 continue
             backoff = POLL_BACKOFF_START
-            for update in updates:
-                self._process(update)
+
+    def _poll_once(self) -> None:
+        """Fetch one batch of updates and process each of them in order."""
+        for update in self.client.get_updates(offset=self._current_offset()):
+            self._process(update)
 
     def _process(self, update: dict[str, Any]) -> None:
         """Handle one update without letting any error escape, then store its offset."""
@@ -348,10 +402,15 @@ class TelegramBot:
         # Stored even after a failure: replaying a poison update would loop forever.
         update_id = update.get("update_id")
         if isinstance(update_id, int):
-            self.store.set_value(OFFSET_KEY, str(update_id + 1))
+            # Kept in memory first: if the store write fails, the retry still
+            # asks Telegram for the next update instead of replaying this one.
+            self._offset = update_id + 1
+            self.store.set_value(OFFSET_KEY, str(self._offset))
 
-    def _stored_offset(self) -> int | None:
-        """Return the persisted offset, or None when absent or unreadable."""
+    def _current_offset(self) -> int | None:
+        """Return the in-memory offset, else the persisted one (None if absent or unreadable)."""
+        if self._offset is not None:
+            return self._offset
         raw = self.store.get_value(OFFSET_KEY)
         if raw is None:
             return None
