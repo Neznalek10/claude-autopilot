@@ -304,13 +304,16 @@ class EngineTestCase(unittest.TestCase):
         """
         return self.run_now(self.engine.enqueue_prompt(text, dispatch=False))
 
-    def run_news(self) -> RunRecord:
+    def run_news(self, trigger: str = TRIGGER_TELEGRAM) -> RunRecord:
         """Queue and execute the "news" task without workers.
+
+        Args:
+            trigger: Trigger of the run. Telegram by default: manual (CLI) runs are never retried.
 
         Returns:
             The finished record.
         """
-        return self.run_now(self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False))
+        return self.run_now(self.engine.enqueue_task("news", trigger, dispatch=False))
 
 
 class ConfigTests(EngineTestCase):
@@ -764,7 +767,7 @@ class RateLimitTests(EngineTestCase):
         self.runner.queue(self.limit(reset))
         self.run_news()
         self.set_tasks(self.news, make_task("plan", "Plan", ()))
-        deferred = self.run_now(self.engine.enqueue_task("plan", TRIGGER_MANUAL, dispatch=False))
+        deferred = self.run_now(self.engine.enqueue_task("plan", TRIGGER_TELEGRAM, dispatch=False))
         chat = self.chat("hello")
         self.assertEqual(len(self.runner.calls), 1)
         for record in (deferred, chat):
@@ -788,7 +791,7 @@ class RateLimitTests(EngineTestCase):
         self.runner.queue(self.limit(reset))
         first = self.run_news()
         self.set_tasks(self.news, make_task("plan", "Plan", ()))
-        second = self.run_now(self.engine.enqueue_task("plan", TRIGGER_MANUAL, dispatch=False))
+        second = self.run_now(self.engine.enqueue_task("plan", TRIGGER_TELEGRAM, dispatch=False))
         self.assertEqual(self.engine.tick(), [])  # not yet
         self.clock.advance(hours=1, minutes=1)
         ids = self.engine.tick()
@@ -796,7 +799,7 @@ class RateLimitTests(EngineTestCase):
         retries = [self.store.get_run(i) for i in ids]
         self.assertEqual([r.retry_of for r in retries], [first.id, second.id])
         self.assertEqual([(r.task_name, r.prompt, r.trigger) for r in retries],
-                         [("news", "Say news", TRIGGER_MANUAL), ("plan", "Plan", TRIGGER_MANUAL)])
+                         [("news", "Say news", TRIGGER_TELEGRAM), ("plan", "Plan", TRIGGER_TELEGRAM)])
         self.assertEqual(self.engine.tick(), [])  # retried exactly once
         self.assertEqual(self.store.due_retries(self.clock()), [])
         done = self.run_now(ids[0])
@@ -826,19 +829,19 @@ class RateLimitTests(EngineTestCase):
         self.runner.queue(self.limit(START + timedelta(minutes=10)))
         self.run_news()
         self.clock.advance(minutes=11)
-        self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False)
+        self.engine.enqueue_task("news", TRIGGER_TELEGRAM, dispatch=False)
         self.assertEqual(self.engine.tick(), [])
         self.assertEqual(len(self.store.active_runs()), 1)
 
     def test_gives_up_after_three_retries(self) -> None:
         """The fourth limited run in a chain is stored without retry, with a final error, and notified."""
-        original = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        original = self.store.create_run(task_name="news", trigger=TRIGGER_TELEGRAM, prompt="p", queued_at=START)
         previous = original
         for _ in range(3):
             self.store.mark_running(previous, START)
             self.store.finish_run(previous, status=STATUS_RATE_LIMITED, finished_at=START)
             previous = self.store.create_run(
-                task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START, retry_of=previous
+                task_name="news", trigger=TRIGGER_TELEGRAM, prompt="p", queued_at=START, retry_of=previous
             )
         self.runner.queue(self.limit(START + timedelta(hours=1)))
         record = self.run_now(previous)
@@ -854,13 +857,13 @@ class RateLimitTests(EngineTestCase):
 
     def test_gate_deferrals_do_not_use_up_the_retries(self) -> None:
         """Links created by gate deferrals never called Claude, so they don't count towards giving up."""
-        previous = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        previous = self.store.create_run(task_name="news", trigger=TRIGGER_TELEGRAM, prompt="p", queued_at=START)
         # One real attempt followed by four deferrals: depth 5, but only one started run.
         self.store.mark_running(previous, START)
         for _ in range(5):
             self.store.finish_run(previous, status=STATUS_RATE_LIMITED, finished_at=START)
             previous = self.store.create_run(
-                task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START, retry_of=previous
+                task_name="news", trigger=TRIGGER_TELEGRAM, prompt="p", queued_at=START, retry_of=previous
             )
         self.runner.queue(self.limit(START + timedelta(hours=1)))
         record = self.run_now(previous)
@@ -872,11 +875,11 @@ class RateLimitTests(EngineTestCase):
     def test_deferred_run_in_a_long_chain_still_waits_instead_of_giving_up(self) -> None:
         """A run behind a closed gate is deferred without Claude and never gives up."""
         self.store.set_value(LIMITED_UNTIL_KEY, (START + timedelta(hours=1)).isoformat())
-        previous = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        previous = self.store.create_run(task_name="news", trigger=TRIGGER_TELEGRAM, prompt="p", queued_at=START)
         for _ in range(4):
             self.store.finish_run(previous, status=STATUS_RATE_LIMITED, finished_at=START)
             previous = self.store.create_run(
-                task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START, retry_of=previous
+                task_name="news", trigger=TRIGGER_TELEGRAM, prompt="p", queued_at=START, retry_of=previous
             )
         record = self.run_now(previous)
         self.assertEqual(self.runner.calls, [])
@@ -884,12 +887,12 @@ class RateLimitTests(EngineTestCase):
 
     def test_third_retry_is_still_allowed(self) -> None:
         """A run at retry depth 2 is limited again and still schedules another retry."""
-        previous = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        previous = self.store.create_run(task_name="news", trigger=TRIGGER_TELEGRAM, prompt="p", queued_at=START)
         for _ in range(2):
             self.store.mark_running(previous, START)
             self.store.finish_run(previous, status=STATUS_RATE_LIMITED, finished_at=START)
             previous = self.store.create_run(
-                task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START, retry_of=previous
+                task_name="news", trigger=TRIGGER_TELEGRAM, prompt="p", queued_at=START, retry_of=previous
             )
         self.runner.queue(self.limit(START + timedelta(hours=1)))
         record = self.run_now(previous)
@@ -912,10 +915,83 @@ class RateLimitTests(EngineTestCase):
         self.run_news()
         restarted = self.make_engine()
         restarted.load_config()
-        run_id = restarted.enqueue_task("news", TRIGGER_MANUAL, dispatch=False)
+        run_id = restarted.enqueue_task("news", TRIGGER_TELEGRAM, dispatch=False)
         record = restarted.execute_run(run_id)
         self.assertEqual(record.status, STATUS_RATE_LIMITED)
         self.assertEqual(len(self.runner.calls), 1)
+
+
+class ManualRunLimitTests(EngineTestCase):
+    """Manual (CLI) runs are never retried in the background, but the account-wide gate still closes."""
+
+    def limited(self, retry_at: datetime | None) -> RunOutcome:
+        """Build a rate-limited outcome.
+
+        Args:
+            retry_at: Reset time reported by Claude, or None.
+
+        Returns:
+            A rate_limited RunOutcome.
+        """
+        return RunOutcome(status=STATUS_RATE_LIMITED, error="You've hit your limit", retry_at=retry_at)
+
+    def test_manual_run_hitting_the_limit_has_no_retry_but_closes_the_gate(self) -> None:
+        """The run is stored without retry_at, says when to try again, and the gate is closed."""
+        reset = START + timedelta(hours=1)
+        self.runner.queue(self.limited(reset))
+        record = self.run_news(TRIGGER_MANUAL)
+        self.assertEqual(record.status, STATUS_RATE_LIMITED)
+        self.assertIsNone(record.retry_at)
+        self.assertEqual(
+            record.error, "The Claude usage limit is active until 08:30. Run this again after that."
+        )
+        self.assertEqual(self.store.get_value(LIMITED_UNTIL_KEY), reset.isoformat())
+        self.assertEqual(self.notifier.runs, [])
+
+    def test_manual_run_is_not_retried_after_the_reset(self) -> None:
+        """Nothing is queued in the background once the limit has reset."""
+        self.runner.queue(self.limited(START + timedelta(minutes=30)))
+        self.run_news(TRIGGER_MANUAL)
+        self.clock.advance(hours=2)
+        self.assertEqual(self.engine.tick(), [])
+        self.assertEqual(self.store.active_runs(), [])
+
+    def test_manual_run_without_a_reset_time_names_the_default_delay(self) -> None:
+        """An unknown reset time falls back to DEFAULT_RETRY_DELAY in both the gate and the message."""
+        self.runner.queue(self.limited(None))
+        record = self.run_news(TRIGGER_MANUAL)
+        self.assertIn("08:30", record.error)
+        self.assertEqual(self.store.get_value(LIMITED_UNTIL_KEY), (START + DEFAULT_RETRY_DELAY).isoformat())
+
+    def test_manual_run_meeting_a_closed_gate_is_not_retried(self) -> None:
+        """A deferred manual run (no Claude call) has no retry_at and an error naming the reset time."""
+        self.store.set_value(LIMITED_UNTIL_KEY, (START + timedelta(hours=1)).isoformat())
+        record = self.run_news(TRIGGER_MANUAL)
+        self.assertEqual(self.runner.calls, [])
+        self.assertIsNone(record.retry_at)
+        self.assertEqual(
+            record.error, "The Claude usage limit is active until 08:30. Run this again after that."
+        )
+        self.clock.advance(hours=2)
+        self.assertEqual(self.engine.tick(), [])
+
+    def test_manual_ask_follows_the_same_rule(self) -> None:
+        """One-off asks from the CLI are manual runs too."""
+        self.runner.queue(self.limited(START + timedelta(hours=1)))
+        record = self.run_now(self.engine.enqueue_prompt("one-off", TRIGGER_MANUAL, dispatch=False))
+        self.assertIsNone(record.retry_at)
+
+    def test_other_triggers_keep_their_retry(self) -> None:
+        """Telegram, schedule and chat runs still retry automatically."""
+        for trigger in (TRIGGER_TELEGRAM, TRIGGER_SCHEDULE):
+            with self.subTest(trigger=trigger):
+                self.store.set_value(LIMITED_UNTIL_KEY, None)
+                self.runner.queue(self.limited(START + timedelta(hours=1)))
+                record = self.run_news(trigger)
+                self.assertIsNotNone(record.retry_at)
+                self.store.finish_run(record.id, status=STATUS_ERROR, finished_at=START)  # frees the task
+        self.runner.queue(self.limited(START + timedelta(hours=1)))
+        self.assertIsNotNone(self.chat().retry_at)
 
 
 class ChatTests(EngineTestCase):
@@ -1252,6 +1328,84 @@ class ShutdownSignalTests(EngineTestCase):
         self.assertEqual(self.store.get_value(CHAT_SESSION_KEY), "s1")
         self.assertEqual(self.chat().status, STATUS_SUCCESS)
         self.assertEqual(self.runner.calls[2].resume_session, "s1")
+
+
+class InFlightTests(EngineTestCase):
+    """Runs this engine is executing are never swept, and interrupts are recorded wherever they strike."""
+
+    def test_live_run_is_not_swept_after_a_timeout_change_and_a_clock_jump(self) -> None:
+        """Lowering timeout_minutes and jumping the clock must not mark a live run interrupted."""
+        observed: dict[str, object] = {}
+
+        def meanwhile() -> None:
+            """Edit the task's timeout, jump the clock three hours and tick, all mid-run."""
+            self.set_tasks(make_task("news", "Say news", (), options=make_options(timeout_seconds=60)))
+            self.clock.advance(hours=3)
+            self.engine.tick()
+            observed["status"] = self.store.active_runs()[0].status
+            observed["second_copy"] = self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False)
+
+        self.runner.on_run = meanwhile
+        record = self.run_news()
+        self.assertEqual(observed["status"], STATUS_RUNNING)
+        self.assertIsNone(observed["second_copy"])
+        self.assertEqual(record.status, STATUS_SUCCESS)
+
+    def test_run_is_swept_once_this_engine_no_longer_executes_it(self) -> None:
+        """After execute_run ends, nothing keeps the id protected (a foreign row of that id would be swept)."""
+        self.run_news()
+        stale = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        self.store.mark_running(stale, START)
+        self.clock.advance(hours=3)
+        self.engine.tick()
+        self.assertEqual(self.store.get_run(stale).error, INTERRUPTED_MESSAGE)
+
+    def test_enqueue_task_sweeps_a_stale_row_before_its_dedupe_check(self) -> None:
+        """A CLI-only user whose earlier run was killed with -9 can run the task again without a service."""
+        stale = self.store.create_run(task_name="news", trigger=TRIGGER_MANUAL, prompt="p", queued_at=START)
+        self.store.mark_running(stale, START)
+        self.assertIsNone(self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False))
+        self.clock.advance(hours=1)
+        self.assertIsNotNone(self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False))
+        self.assertEqual(self.store.get_run(stale).error, INTERRUPTED_MESSAGE)
+
+    def test_interrupt_before_the_run_is_marked_running_is_recorded(self) -> None:
+        """A KeyboardInterrupt between loading the record and mark_running does not leave it queued."""
+        run_id = self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False)
+        with mock.patch.object(self.store, "mark_running", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.engine.execute_run(run_id)
+        record = self.store.get_run(run_id)
+        self.assertEqual((record.status, record.error), (STATUS_ERROR, INTERRUPTED_MESSAGE))
+        self.assertIsNotNone(self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False))
+
+    def test_interrupt_after_the_run_finished_keeps_its_result(self) -> None:
+        """An interrupt during notification must not overwrite the finished run."""
+        self.notifier.notify_run = mock.Mock(side_effect=KeyboardInterrupt)  # type: ignore[method-assign]
+        run_id = self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False)
+        with self.assertRaises(KeyboardInterrupt):
+            self.engine.execute_run(run_id)
+        self.assertEqual(self.store.get_run(run_id).status, STATUS_SUCCESS)
+
+    def test_failing_cleanup_does_not_mask_the_interrupt(self) -> None:
+        """If recording the interrupt fails, the original KeyboardInterrupt still propagates."""
+        run_id = self.engine.enqueue_task("news", TRIGGER_MANUAL, dispatch=False)
+        self.runner.queue(KeyboardInterrupt())
+        with mock.patch.object(self.store, "finish_run", side_effect=RuntimeError("db gone")):
+            with self.assertLogs("autopilot.engine", level="ERROR"):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.engine.execute_run(run_id)
+
+    def test_corrupt_retry_cycle_does_not_hang(self) -> None:
+        """A retry_of cycle in the store is cut instead of looping forever."""
+        first = self.store.create_run(
+            task_name="news", trigger=TRIGGER_TELEGRAM, prompt="p", queued_at=START, retry_of=2
+        )
+        second = self.store.create_run(
+            task_name="news", trigger=TRIGGER_TELEGRAM, prompt="p", queued_at=START, retry_of=first
+        )
+        self.runner.queue(RunOutcome(status=STATUS_RATE_LIMITED, retry_at=START + timedelta(hours=1)))
+        self.assertEqual(self.run_now(second).status, STATUS_RATE_LIMITED)
 
 
 class StaleRunTests(EngineTestCase):

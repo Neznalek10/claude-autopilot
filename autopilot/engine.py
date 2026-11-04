@@ -30,7 +30,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -49,6 +49,7 @@ from autopilot.models import (
     STATUS_RUNNING,
     STATUS_SUCCESS,
     TRIGGER_CHAT,
+    TRIGGER_MANUAL,
     TRIGGER_SCHEDULE,
     Notifier,
     QueueSnapshot,
@@ -87,6 +88,8 @@ LIMIT_NOTICE = (
     "⏳ Claude usage limit reached. All runs wait until {time}, then retry automatically."
 )
 LIMIT_WAIT_MESSAGE = "Waiting for the Claude usage limit to reset at {time}."
+# Manual (CLI) runs are never retried in the background, so their error tells the user when to retry.
+MANUAL_LIMIT_MESSAGE = "The Claude usage limit is active until {time}. Run this again after that."
 GIVE_UP_MESSAGE = "Gave up after {retries} retries because of the usage limit."
 
 
@@ -171,6 +174,9 @@ class Engine:
         self._queue: queue.Queue[int | None] = queue.Queue()
         self._workers: list[threading.Thread] = []
         self._stopping = threading.Event()
+        # Ids of the runs this engine is executing right now. The stale-run sweep must never
+        # touch them: a live run is not abandoned, whatever its age or the current timeout say.
+        self._in_flight: set[int] = set()
         # Held while checking for an active run and creating the new one, so two
         # threads cannot both queue the same task.
         self._enqueue_lock = threading.Lock()
@@ -364,6 +370,9 @@ class Engine:
             The new run id, or None when deduplicated.
         """
         with self._enqueue_lock:
+            if dedupe:
+                # A row abandoned by a killed process must not block the task.
+                self._finish_stale_runs(self._clock())
             if dedupe and any(r.task_name == task_name for r in self._store.active_runs()):
                 logger.info("Task '%s' is already queued or running, not queuing it again", task_name)
                 return None
@@ -452,14 +461,18 @@ class Engine:
 
         A process killed without cleanup (``kill -9`` on a CLI run) leaves its
         row ``running``, which would block the task through deduplication. The
-        runner enforces each run's timeout, so a run older than the timeout
-        plus STALE_RUN_GRACE cannot still be alive.
+        runner enforces each run's timeout, so a foreign run older than the
+        timeout plus STALE_RUN_GRACE cannot still be alive. Runs this engine is
+        executing itself are never swept (a lowered timeout_minutes or a clock
+        jump would otherwise kill a live run and let a second copy start).
 
         Args:
             now: The current moment.
         """
         for record in self._store.active_runs():
             if record.status != STATUS_RUNNING or record.started_at is None:
+                continue
+            if record.id in self._in_flight:
                 continue
             limit = timedelta(seconds=self._timeout_seconds(record)) + STALE_RUN_GRACE
             if to_utc(now) - to_utc(record.started_at) > limit:
@@ -620,20 +633,45 @@ class Engine:
     def execute_run(self, run_id: int) -> RunRecord | None:
         """Execute one queued run to completion and record the outcome.
 
+        Any BaseException (KeyboardInterrupt, SystemExit, ...) raised while the
+        run is being executed finishes it as interrupted, so it cannot stay
+        queued or running and block its task, and is then re-raised.
+
         Args:
             run_id: Id of a run created by ``enqueue_*``.
 
         Returns:
             The record: finished if this call executed it, unchanged if the run
             was not queued, or None when the id is unknown.
+
+        Raises:
+            BaseException: Whatever interrupted the run, after it was recorded.
         """
         record = self._store.get_run(run_id)
         if record is None or record.status != STATUS_QUEUED:
             return record
+        self._in_flight.add(run_id)
+        try:
+            return self._execute_loaded(record)
+        except BaseException:
+            self._interrupt_if_unfinished(run_id)
+            raise
+        finally:
+            self._in_flight.discard(run_id)
+
+    def _execute_loaded(self, record: RunRecord) -> RunRecord:
+        """Execute a queued run whose record is already loaded.
+
+        Args:
+            record: The queued run.
+
+        Returns:
+            The finished record.
+        """
         options = self._options_for(record)
         if options is None:
             return self._store.finish_run(
-                run_id,
+                record.id,
                 status=STATUS_CANCELLED,
                 finished_at=self._clock(),
                 error=REMOVED_TASK_MESSAGE,
@@ -643,6 +681,23 @@ class Engine:
             with self._chat_lock:
                 return self._execute(record, options)
         return self._execute(record, options)
+
+    def _interrupt_if_unfinished(self, run_id: int) -> None:
+        """Finish a run as interrupted unless it already reached a final status.
+
+        Runs while an exception propagates, so a failure here is logged instead
+        of replacing the original exception.
+
+        Args:
+            run_id: The run that was being executed.
+        """
+        try:
+            current = self._store.get_run(run_id)
+            if current is not None and not current.is_finished:
+                self._finish_interrupted(current, self._clock())
+        # Deliberately broad: cleanup must never mask the interrupt that is being handled.
+        except Exception:
+            logger.exception("Could not record run #%d as interrupted", run_id)
 
     def _options_for(self, record: RunRecord) -> RunOptions | None:
         """Pick the run options for a record from the current configuration.
@@ -673,13 +728,16 @@ class Engine:
         now = self._clock()
         limited_until = self._limited_until(now)
         if limited_until is not None:
-            # Deferred without calling Claude; it retries when the limit resets.
+            # Deferred without calling Claude. Background runs retry when the limit resets;
+            # a manual run is not retried behind the user's back, its error says when to retry.
+            is_manual = record.trigger == TRIGGER_MANUAL
+            message = MANUAL_LIMIT_MESSAGE if is_manual else LIMIT_WAIT_MESSAGE
             finished = self._store.finish_run(
                 record.id,
                 status=STATUS_RATE_LIMITED,
                 finished_at=now,
-                error=LIMIT_WAIT_MESSAGE.format(time=_clock_time(limited_until, now)),
-                retry_at=limited_until,
+                error=message.format(time=_clock_time(limited_until, now)),
+                retry_at=None if is_manual else limited_until,
             )
             logger.info("Run #%d deferred until the usage limit resets", record.id)
             return finished
@@ -704,11 +762,12 @@ class Engine:
         return finished
 
     def _finish_interrupted(self, record: RunRecord, now: datetime) -> RunRecord:
-        """Record a run whose Claude call ended because the service is stopping.
+        """Record a run that was cut short as interrupted, silently.
 
-        Whatever the call returned is the product of stop() killing the process
-        (for example "exited with code -15"), so it is neither reported to the
-        user nor allowed to change the chat session.
+        Used when the service is stopping (whatever the call returned is the
+        product of stop() killing the process, for example "exited with code
+        -15") and when a shutdown signal arrives mid-run. Nothing is reported to
+        the user and the chat session is not touched.
 
         Args:
             record: The run being executed.
@@ -727,7 +786,7 @@ class Engine:
     ) -> RunOutcome:
         """Call the runner, turning an unexpected exception into an error outcome.
 
-        A BaseException (shutdown signal) finishes the run as interrupted and is re-raised.
+        A BaseException (shutdown signal) is not caught here; ``execute_run`` records it.
 
         Args:
             record: The run being executed.
@@ -736,9 +795,6 @@ class Engine:
 
         Returns:
             The runner's outcome, or an error outcome carrying the exception message.
-
-        Raises:
-            BaseException: KeyboardInterrupt, SystemExit and the like, after the run is recorded.
         """
         try:
             return self._runner.run(record.prompt, options, resume_session)
@@ -746,11 +802,6 @@ class Engine:
         except Exception as err:
             logger.exception("Run #%d crashed", record.id)
             return RunOutcome(status=STATUS_ERROR, error=str(err) or type(err).__name__)
-        except BaseException:
-            # KeyboardInterrupt or SystemExit (Ctrl-C, SIGTERM): record the run as interrupted so it
-            # does not stay "running" and block its task, then let the shutdown continue.
-            self._finish_interrupted(record, self._clock())
-            raise
 
     def _store_outcome(
         self, run_id: int, outcome: RunOutcome, finished_at: datetime, *, retry_at: datetime | None = None
@@ -805,6 +856,26 @@ class Engine:
             return None
         return session
 
+    def _retry_ancestors(self, record: RunRecord) -> Iterator[RunRecord]:
+        """Walk up a run's ``retry_of`` chain, nearest ancestor first.
+
+        Args:
+            record: A run, possibly a retry.
+
+        Yields:
+            Each run the given one is a retry of, ending at the original. A
+            missing row ends the walk; a corrupt cycle is cut instead of looping.
+        """
+        seen = {record.id}
+        parent_id = record.retry_of
+        while parent_id is not None and parent_id not in seen:
+            seen.add(parent_id)
+            parent = self._store.get_run(parent_id)
+            if parent is None:
+                return
+            yield parent
+            parent_id = parent.retry_of
+
     def _first_queued_at(self, record: RunRecord) -> datetime:
         """Find when the first run of a retry chain was queued.
 
@@ -818,16 +889,8 @@ class Engine:
             ``queued_at`` of the root of the ``retry_of`` chain (the record's own if it has none).
         """
         queued_at = record.queued_at
-        seen = {record.id}
-        parent_id = record.retry_of
-        # ``seen`` guards against a corrupt cycle in the chain.
-        while parent_id is not None and parent_id not in seen:
-            seen.add(parent_id)
-            parent = self._store.get_run(parent_id)
-            if parent is None:
-                break
-            queued_at = parent.queued_at
-            parent_id = parent.retry_of
+        for ancestor in self._retry_ancestors(record):
+            queued_at = ancestor.queued_at
         return queued_at
 
     def _apply_chat_outcome(
@@ -872,6 +935,8 @@ class Engine:
         Returns:
             The finished record.
         """
+        if record.trigger == TRIGGER_MANUAL:
+            return self._finish_manual_rate_limited(record, outcome, now)
         if self._started_retries(record) >= MAX_RATE_LIMIT_RETRIES:
             giving_up = dataclasses.replace(
                 outcome, error=GIVE_UP_MESSAGE.format(retries=MAX_RATE_LIMIT_RETRIES)
@@ -882,6 +947,27 @@ class Engine:
         retry_at = outcome.retry_at or now + DEFAULT_RETRY_DELAY
         finished = self._store_outcome(record.id, outcome, now, retry_at=retry_at)
         self._close_gate(retry_at, now)
+        return finished
+
+    def _finish_manual_rate_limited(self, record: RunRecord, outcome: RunOutcome, now: datetime) -> RunRecord:
+        """Record a manual (CLI) run that hit the usage limit, without scheduling a retry.
+
+        A retry would run in the background and push its answer to Telegram
+        although the user started the run from the terminal (possibly with
+        --no-notify). The gate still closes: the limit is account-wide.
+
+        Args:
+            record: The manual run that was limited.
+            outcome: The rate_limited outcome from the runner.
+            now: The current moment.
+
+        Returns:
+            The finished record, with no retry time and an error naming when to try again.
+        """
+        reset_at = outcome.retry_at or now + DEFAULT_RETRY_DELAY
+        limited = dataclasses.replace(outcome, error=MANUAL_LIMIT_MESSAGE.format(time=_clock_time(reset_at, now)))
+        finished = self._store_outcome(record.id, limited, now)
+        self._close_gate(reset_at, now)
         return finished
 
     def _started_retries(self, record: RunRecord) -> int:
@@ -896,19 +982,7 @@ class Engine:
         Returns:
             How many runs above it in the ``retry_of`` chain have a start time.
         """
-        started = 0
-        seen = {record.id}
-        parent_id = record.retry_of
-        # ``seen`` guards against a corrupt cycle in the chain.
-        while parent_id is not None and parent_id not in seen:
-            seen.add(parent_id)
-            parent = self._store.get_run(parent_id)
-            if parent is None:
-                break
-            if parent.started_at is not None:
-                started += 1
-            parent_id = parent.retry_of
-        return started
+        return sum(1 for ancestor in self._retry_ancestors(record) if ancestor.started_at is not None)
 
     def _close_gate(self, until: datetime, now: datetime) -> None:
         """Hold every run until the usage limit resets and tell the user once.
