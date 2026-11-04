@@ -73,6 +73,8 @@ CONFIRM_YES = ("y", "yes")
 CODE_DIGITS = 6
 LOCK_FILE_NAME = "autopilot.lock"
 LOCK_FILE_MODE = 0o600
+# A closed terminal sends SIGHUP; treat it like SIGTERM so runs are cleaned up.
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 NO_TOKEN_TERMINAL_MESSAGE = "telegram-setup needs an interactive terminal to read the bot token."
 NO_TERMINAL_MESSAGE = "telegram-setup needs an interactive terminal to confirm the chat."
 DATA_DIR_MODE = 0o700
@@ -334,7 +336,7 @@ def _serve(app: App, stop: threading.Event) -> None:
     on_main_thread = threading.current_thread() is threading.main_thread()
     previous: dict[int, object] = {}
     if on_main_thread:
-        for signum in (signal.SIGTERM, signal.SIGINT):
+        for signum in STOP_SIGNALS:
             previous[signum] = signal.signal(signum, lambda _signum, _frame: stop.set())
     try:
         # Before the bot thread starts, or fresh runs would be marked interrupted too.
@@ -405,6 +407,13 @@ def telegram_setup(
         TelegramError: Telegram rejected a call.
     """
     out = sys.stdout if out is None else out
+    if (
+        settings.telegram_token is None
+        and secret_input is getpass.getpass
+        and not sys.stdin.isatty()
+    ):
+        # getpass would print echo warnings before failing; refuse up front instead.
+        raise AutopilotError(NO_TOKEN_TERMINAL_MESSAGE)
     token = settings.telegram_token or _read_token(secret_input)
     client = client_factory(token)
     username = client.get_me().get("username", "")

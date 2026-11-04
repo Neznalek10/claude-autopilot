@@ -10,6 +10,7 @@ Telegram is FakeTelegramClient and all paths live in temp folders.
 from __future__ import annotations
 
 import contextlib
+import getpass
 import io
 import logging
 import os
@@ -21,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -321,6 +323,20 @@ class RunServiceTests(AppTestCase):
             thread.join(WAIT_SECONDS)
         self.assertFalse(thread.is_alive())
 
+    def test_sighup_stops_the_service(self) -> None:
+        """Closing the terminal (SIGHUP) ends the service like SIGTERM and restores the handler."""
+        settings = self.make_settings()
+        self.write_tasks(settings)
+        app = build_app(settings)
+        before = signal.getsignal(signal.SIGHUP)
+        stop = threading.Event()
+        timer = threading.Timer(0.3, os.kill, args=(os.getpid(), signal.SIGHUP))
+        timer.start()
+        run_service(app, stop)
+        timer.join()
+        self.assertTrue(stop.is_set())
+        self.assertEqual(signal.getsignal(signal.SIGHUP), before)
+
     def test_second_instance_is_refused_while_the_first_runs(self) -> None:
         """A second service on the same data folder fails fast and does not touch the first one's runs."""
         settings = self.make_settings()
@@ -601,6 +617,14 @@ class TelegramSetupTests(AppTestCase):
 
         with self.assertRaises(AutopilotError) as caught:
             self.run_setup(self.make_settings(), FakeTelegramClient(), secret_input=no_terminal)
+        self.assertIn("interactive terminal", str(caught.exception))
+
+    def test_no_tty_fails_before_prompting(self) -> None:
+        """With the default prompt and a non-terminal stdin, fail up front (no getpass warnings)."""
+        settings = self.make_settings()
+        with unittest.mock.patch.object(sys, "stdin", io.StringIO("")):
+            with self.assertRaises(AutopilotError) as caught:
+                telegram_setup(settings, secret_input=getpass.getpass, client_factory=lambda t: FakeTelegramClient())
         self.assertIn("interactive terminal", str(caught.exception))
 
     def test_bad_token_is_rejected_before_saving(self) -> None:

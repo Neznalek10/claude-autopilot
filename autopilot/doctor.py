@@ -64,6 +64,7 @@ FIX_INSTALL_CLAUDE = "Install Claude Code (`claude install`) or set CLAUDE_BIN i
 FIX_LOGIN = "Run `claude auth login` and sign in with your Claude subscription."
 TASKS_PREFIX = "tasks.toml: "
 TASKS_NAME_PREFIX = "tasks.toml "
+INIT_HINT_SUFFIX = " Run `autopilot init` to create one."
 FIX_CLI_FIRST = "Fix the Claude CLI check above first."
 FIX_TASKS = "Edit tasks.toml, then run `autopilot validate`."
 FIX_TASKS_MISSING = "Run `autopilot init` to create it."
@@ -131,7 +132,11 @@ def check_claude_login(binary: Path, run: CommandRunner) -> CheckResult:
         output, fail when logged out.
     """
     name = "Claude login"
-    code, stdout, stderr = run([str(binary), "auth", "status", "--json"], COMMAND_TIMEOUT_SECONDS)
+    # Strip the API credentials like real runs do, so the check sees the login real runs use.
+    command = ["env"]
+    for variable in API_KEY_VARIABLES:
+        command += ["-u", variable]
+    code, stdout, stderr = run([*command, str(binary), "auth", "status", "--json"], COMMAND_TIMEOUT_SECONDS)
     status = _parse_json_object(stdout)
     if status is None:
         reason = (stderr or stdout).strip()[:MAX_REASON_CHARS] or f"exit code {code}"
@@ -176,12 +181,25 @@ def check_api_key(env: Mapping[str, str]) -> CheckResult:
     present = [variable for variable in API_KEY_VARIABLES if env.get(variable)]
     if not present:
         return CheckResult(name, STATUS_OK, "no Anthropic API key in the environment")
+    many = len(present) > 1
     return CheckResult(
         name,
         STATUS_WARN,
-        f"{', '.join(present)} {'is' if len(present) == 1 else 'are'} set; autopilot removes it from Claude runs so your subscription is used",
-        "Unset it if you want plain `claude` in this shell to use your subscription too.",
+        f"{', '.join(present)} {'are' if many else 'is'} set; autopilot removes "
+        f"{'them' if many else 'it'} from Claude runs so your subscription is used",
+        f"Unset {'them' if many else 'it'} if you want plain `claude` in this shell to use your subscription too.",
     )
+
+
+def _tasks_detail(message: str) -> str:
+    """Drop what the report already says from a tasks.toml error.
+
+    The report line starts with the check name, and the missing-file fix repeats
+    the `autopilot init` hint, so neither is kept in the detail. Multi-line
+    messages lose the "tasks.toml: " prefix on every line.
+    """
+    lines = [line.removeprefix(TASKS_PREFIX).removeprefix(TASKS_NAME_PREFIX) for line in message.splitlines()]
+    return "\n".join(lines).removesuffix(INIT_HINT_SUFFIX)
 
 
 def check_tasks(settings: Settings) -> CheckResult:
@@ -198,8 +216,7 @@ def check_tasks(settings: Settings) -> CheckResult:
         config = load_task_config(settings.tasks_file)
     except AutopilotError as err:
         fix = FIX_TASKS if settings.tasks_file.is_file() else FIX_TASKS_MISSING
-        # Messages start with "tasks.toml: " or "tasks.toml not found"; the report adds the name once.
-        return CheckResult(name, STATUS_FAIL, str(err).removeprefix(TASKS_PREFIX).removeprefix(TASKS_NAME_PREFIX), fix)
+        return CheckResult(name, STATUS_FAIL, _tasks_detail(str(err)), fix)
     enabled = sum(1 for task in config.tasks.values() if task.enabled)
     return CheckResult(name, STATUS_OK, f"{len(config.tasks)} tasks ({enabled} enabled)")
 
@@ -360,7 +377,10 @@ def format_report(results: Sequence[CheckResult]) -> str:
     """
     lines: list[str] = []
     for result in results:
-        lines.append(f"{STATUS_MARKS[result.status]} {result.name}: {result.detail}")
+        first, *rest = result.detail.splitlines() or [""]
+        lines.append(f"{STATUS_MARKS[result.status]} {result.name}: {first}")
+        # Continuation lines of a multi-line detail sit under the check.
+        lines.extend(f"{FIX_INDENT}{line}" for line in rest)
         if result.fix:
             lines.append(f"{FIX_INDENT}Fix: {result.fix}")
     counts = {status: sum(1 for r in results if r.status == status) for status in STATUS_MARKS}

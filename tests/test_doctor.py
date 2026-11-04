@@ -66,7 +66,7 @@ class ScriptedRunner:
         for suffix, answer in self.answers.items():
             if command.endswith(suffix):
                 return answer
-        if args[0] == str(FAKE_CLAUDE):
+        if str(FAKE_CLAUDE) in args:
             return run_command(args, timeout)
         return 127, "", "not scripted"
 
@@ -129,6 +129,16 @@ class ClaudeLoginTests(DoctorTestCase):
         for secret in (EMAIL, "org-123", "Example Org"):
             self.assertNotIn(secret, report)
 
+    def test_login_check_strips_api_credentials(self) -> None:
+        """`auth status` runs through env -u so it sees what real runs see."""
+        runner = ScriptedRunner({"auth status --json": (0, LOGIN_JSON, "")})
+        check_claude_login(FAKE_CLAUDE, runner)
+        self.assertEqual(
+            runner.calls[0],
+            ["env", "-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN",
+             str(FAKE_CLAUDE), "auth", "status", "--json"],
+        )
+
     def test_real_fake_claude_output_is_ok(self) -> None:
         """The bundled fake CLI reports a logged-in subscription."""
         result = check_claude_login(FAKE_CLAUDE, ScriptedRunner())
@@ -182,7 +192,12 @@ class ApiKeyTests(unittest.TestCase):
         """Two variables read "are set", one reads "is set"."""
         both = check_api_key({"ANTHROPIC_API_KEY": "a", "ANTHROPIC_AUTH_TOKEN": "b"})
         self.assertIn("ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN are set", both.detail)
-        self.assertIn("ANTHROPIC_API_KEY is set", check_api_key({"ANTHROPIC_API_KEY": "a"}).detail)
+        self.assertIn("removes them", both.detail)
+        self.assertIn("Unset them", both.fix)
+        one = check_api_key({"ANTHROPIC_API_KEY": "a"})
+        self.assertIn("ANTHROPIC_API_KEY is set", one.detail)
+        self.assertIn("removes it", one.detail)
+        self.assertIn("Unset it", one.fix)
 
     def test_auth_token_warns_and_empty_value_is_ignored(self) -> None:
         """The auth token variable warns too; an empty value counts as unset."""
@@ -204,9 +219,9 @@ class TasksTests(DoctorTestCase):
         """A missing file fails and the message points to `autopilot init`."""
         result = check_tasks(self.make_settings())
         self.assertEqual(result.status, "fail")
-        self.assertIn("autopilot init", result.detail)
         self.assertNotIn("tasks.toml: tasks.toml", format_report([result]))
         self.assertEqual(result.fix, "Run `autopilot init` to create it.")
+        self.assertNotIn("autopilot init", result.detail)
 
     def test_invalid_file_fails_naming_the_field(self) -> None:
         """A typo in a key is reported with the key name."""
@@ -426,6 +441,15 @@ class RunDoctorTests(DoctorTestCase):
         for result in self.run_all(settings, live=True):
             if result.status != "ok":
                 self.assertTrue(result.fix, f"{result.name} has no fix")
+
+    def test_multiline_detail_is_indented_under_the_check(self) -> None:
+        """Continuation lines of a detail are indented, without repeating the prefix."""
+        settings = self.make_settings()
+        settings.tasks_file.write_text('[[task]]\nname = "a"\nprompt = "x"\nbad1 = 1\n')
+        result = check_tasks(settings)
+        multi = CheckResult("tasks.toml", "fail", "first\nsecond", "fix")
+        self.assertEqual(format_report([multi]).splitlines()[:3], ["✘ tasks.toml: first", "    second", "    Fix: fix"])
+        self.assertFalse(result.detail.startswith("tasks.toml:"))
 
     def test_report_format_and_summary(self) -> None:
         """Marks, indented fixes and the summary line follow the contract."""
