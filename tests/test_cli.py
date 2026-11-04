@@ -317,6 +317,22 @@ class SubprocessTests(CliTestCase):
         process.stderr.close()
 
 
+    def test_reader_gone_before_any_output_exits_quietly(self) -> None:
+        """A pipe closed before the first write (`autopilot --version | true`) prints no warning."""
+        for argv in (("--version",), ("--help",), ("next", "daily 07:30")):
+            with self.subTest(argv=argv):
+                read_end, write_end = os.pipe()
+                os.close(read_end)
+                process = self.start_cli(*argv, stdout=write_end, stderr=subprocess.PIPE)
+                os.close(write_end)
+                self.addCleanup(process.kill)
+                assert process.stderr is not None
+                code = process.wait(timeout=30)
+                self.assertEqual(process.stderr.read(), "")
+                process.stderr.close()
+                self.assertIn(code, (0, 1))
+
+
 class InitTests(CliTestCase):
     """`autopilot init`."""
 

@@ -254,9 +254,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         >>> main(["next", "daily 07:30", "-n", "2"])  # doctest: +SKIP
         0
     """
-    args = build_parser().parse_args(argv)
     try:
-        return _execute(args)
+        args = build_parser().parse_args(argv)
+    except SystemExit:
+        # --help, --version and usage errors print through argparse and exit here.
+        _flush_stdout()
+        raise
+    try:
+        code = _execute(args)
+        return code if _flush_stdout() else EXIT_FAILURE
     except AutopilotError as err:
         print(f"{PROGRAM}: {err}", file=sys.stderr)
         # Tracebacks are for bug reports, so they are opt-in.
@@ -270,6 +276,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print(file=sys.stderr)
         return EXIT_INTERRUPTED
+
+
+def _flush_stdout() -> bool:
+    """Write buffered output now, while a closed pipe can still be handled quietly.
+
+    Without this, the interpreter flushes stdout at exit, outside every handler,
+    and a reader that already went away (``autopilot list | true``) turns that
+    flush into an "Exception ignored" warning and exit code 120.
+
+    Returns:
+        False when the reader has gone away; stdout then points at devnull.
+    """
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        _silence_stdout()
+        return False
+    return True
 
 
 def _execute(args: argparse.Namespace) -> int:
