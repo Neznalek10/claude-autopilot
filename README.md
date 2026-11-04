@@ -129,7 +129,7 @@ allowed_tools = ["Read", "Glob", "Grep"]
 prompt = "Look at the files that changed in the last 7 days and suggest three priorities."
 ```
 
-The `weekly-review` task has no schedule of its own. It is disabled, so it runs only when you start it with `autopilot run weekly-review` or `/run weekly-review`. The file `tasks.example.toml` documents every key and ships three working tasks. Check your file after each edit with `venv/bin/autopilot validate`, which lists every error with the task and field name, and `venv/bin/autopilot list`, which shows the next run of each task.
+The `weekly-review` task has no schedule of its own. It is disabled, so it runs only when you start it with `autopilot run weekly-review` or `/run weekly-review`. The file `tasks.example.toml` documents every key and ships three working tasks. Check your file after each edit with `venv/bin/autopilot validate`, which lists the problems it finds one per line, with the task and field name (the first problem in each table), and `venv/bin/autopilot list`, which shows the next run of each task.
 
 Edits to `tasks.toml` apply within 30 seconds, with no restart. An invalid edit keeps the previous tasks and sends one warning to your phone.
 
@@ -143,7 +143,7 @@ Settings come from `.env` in the project folder and from the real environment. A
 | `AUTOPILOT_TASKS_FILE` | `tasks.toml` in the home folder | Path to the task file. |
 | `AUTOPILOT_DATA_DIR` | `data/` in the home folder | Folder for `autopilot.db` and `autopilot.log`. |
 | `AUTOPILOT_TIMEZONE` | the system time zone | IANA time zone for schedules, for example `Europe/Prague`. |
-| `AUTOPILOT_MAX_PARALLEL` | `1` | Runs that may execute at the same time, from 1 to 4. |
+| `AUTOPILOT_MAX_PARALLEL` | `1` | Runs that may execute at the same time, from 1 to 4. Keep it at 1 if you chat with the bot: with more workers, quick chat messages can be answered out of order. |
 | `AUTOPILOT_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 | `CLAUDE_BIN` | found automatically | Full path to the Claude Code binary, if autodetection fails. |
 | `TELEGRAM_BOT_TOKEN` | none | Bot token from @BotFather. `telegram-setup` writes it. |
@@ -184,7 +184,7 @@ Run `venv/bin/autopilot <command> --help` for the full options of any command. `
 | Command | What it does | Example |
 |---|---|---|
 | `init` | Creates `tasks.toml` and `.env` from the examples. | `venv/bin/autopilot init` |
-| `start` | Runs the scheduler and the bot in the foreground. Stops on Ctrl+C. | `venv/bin/autopilot start` |
+| `start` | Runs the scheduler and the bot in the foreground. Stops on Ctrl+C or when the terminal closes. Only one `start` (or the service) can run per project folder. | `venv/bin/autopilot start` |
 | `run <task>` | Runs one task now and prints its result. `--no-notify` skips Telegram. | `venv/bin/autopilot run ai-news --no-notify` |
 | `ask "<prompt>"` | Sends a one-off prompt to Claude in a new session. | `venv/bin/autopilot ask "Summarize today's news"` |
 | `list` | Shows each task with its schedule, next run, last run and state. | `venv/bin/autopilot list` |
@@ -246,7 +246,7 @@ sudo loginctl enable-linger $USER
 
 `doctor` reports the linger state. The log file is also kept at `data/autopilot.log` (rotated at 1 MB, three backups). If you move the project folder, run `install-service` again, because the unit stores the project path.
 
-When the service stops, a run that was still going is recorded as interrupted, with status `error`. No notification is sent to your phone for it. The next start does not run it again.
+When the service stops, a run that was still going is recorded as interrupted, with status `error`. No notification is sent to your phone for it. The next start does not run it again. The same happens when you press Ctrl+C (or close the terminal) during `autopilot run` or `autopilot ask`: Claude is stopped, the run is recorded as interrupted, and the task can run again right away.
 
 ## Usage limits
 
@@ -256,6 +256,9 @@ Your Claude subscription has usage limits. When Claude reports that a limit is r
 - You get one message: `⏳ Claude usage limit reached. All runs wait until 22:56, then retry automatically.` The time is the reset time that Claude reported.
 - Other runs wait in the queue without calling Claude. Their status says `Waiting for the Claude usage limit to reset at 22:56.`
 - After the reset, the waiting runs retry automatically. Each original run gets at most three retries. If a run hits the limit again after its third retry, it ends with `Gave up after 3 retries because of the usage limit.`
+- A chat message sent while the limit is active gets an immediate reply with the reset time. It stays queued and is answered after the reset.
+- Runs you start in the terminal (`autopilot run`, `autopilot ask`) are not retried in the background. The command tells you when the limit ends, so you can run it again yourself.
+- Only Claude's own limit messages count. A task that fails because some other service (for example the GitHub API) is rate limited is recorded as a normal error.
 
 Scheduled runs share the plan's limits with your normal Claude use. A busy day of scheduled tasks can use up the limit that you would otherwise have for your own work. For routine tasks, set a smaller model, such as `model = "sonnet"` or `model = "haiku"`, and use `max_budget_usd` to cap the cost of a run.
 
@@ -275,6 +278,8 @@ Web pages can contain hidden instructions. Keep web tools (`WebSearch`, `WebFetc
 **`Claude Code CLI not found`.** Run `venv/bin/autopilot doctor` to see where Autopilot looked. Install Claude Code, then run `claude install` from any working copy. If the binary is somewhere else, set `CLAUDE_BIN` in `.env` to its full path. Restart the service after the change.
 
 **The bot does not answer.** Run `venv/bin/autopilot doctor`. Check that `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set in `.env`, and that the chat id is your own user id. Send your messages from the private chat with the bot, the one `telegram-setup` saved, because messages from other chats are ignored. If the log shows `Telegram polling failed` with a conflict message, another process is polling the same bot (Telegram answers with HTTP 409 in that case). Stop the other one: `systemctl --user stop autopilot` for the service, or stop the `autopilot start` you ran in a terminal. Then start the service again.
+
+**`Autopilot is already running for <folder>`.** Only one `autopilot start` or service can run per project folder. Check `systemctl --user status autopilot` and any terminal where you ran `autopilot start`, and stop the one you don't want.
 
 **A result says `Blocked tools: ...`.** The task tried to use tools that are not in `allowed_tools`, so Claude was not allowed to finish the job. Add only the tools the task really needs to `allowed_tools` in `tasks.toml`. Use the narrowest rule you can, for example `Bash(git log *)` instead of `Bash`.
 

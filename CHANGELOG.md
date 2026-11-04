@@ -24,3 +24,6 @@ First release.
 - systemd user service that starts at boot and restarts after a failure. Runs cut off by a stop are recorded as interrupted.
 - Security: the bot answers only the owner's private chat. Tasks run in an empty private `workspace/` folder by default. Claude is always denied reads of credential and secret files, including `.env` files, SSH, cloud and Git tokens, Claude's credentials and the autopilot data folder. Tools are allow-listed per task.
 - Private files: `.env`, the data folder and the database and log files are owner-only.
+- Robustness: one service per project folder (lock file); Ctrl+C, SIGTERM or SIGHUP during `run`, `ask` or `start` stops Claude and records the run as interrupted; runs stuck after a crash are cleared once they pass their timeout plus five minutes; failed Telegram deliveries are retried once.
+- Usage limits: only Claude's own limit wording counts, the reset time is read in the zone Claude names, chat messages during a limit get an immediate reply, and terminal runs are never retried in the background.
+- `autopilot validate` lists the first problem of every table, one per line.
