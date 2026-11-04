@@ -335,6 +335,21 @@ class ValidationTest(TaskConfigTestCase):
             self.assertTrue(line.startswith(f"tasks.toml: task '{name}': "), line)
             self.assertIn(f"'{field}'", line)
 
+    def test_unknown_keys_in_defaults_and_ask_do_not_hide_task_errors(self) -> None:
+        """A typo in [defaults] or [ask] is listed with the task errors instead of stopping the check."""
+        with self.assertRaises(ConfigError) as ctx:
+            self.parse({
+                "defaults": {"bogus": 1},
+                "ask": {"bogus": 2},
+                "task": [self.task(name="a", model="-x")],
+            })
+        lines = str(ctx.exception).split("\n")
+        self.assertEqual(len(lines), 3, lines)
+        self.assertIn("[defaults]", lines[0])
+        self.assertIn("bogus", lines[0])
+        self.assertIn("[ask]", lines[1])
+        self.assertTrue(lines[2].startswith("tasks.toml: task 'a': "), lines[2])
+
     def test_defaults_ask_and_tasks_errors_are_combined(self) -> None:
         """A bad default is listed once, then [ask] and task errors follow."""
         with self.assertRaises(ConfigError) as ctx:

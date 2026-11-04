@@ -403,14 +403,32 @@ def _parse_task(
 
 
 def _validate_defaults(defaults: Mapping[str, Any], base_dir: Path, protected_rules: tuple[str, ...]) -> None:
-    """Check every value in ``[defaults]`` (options and behaviour keys).
+    """Check every key and value in ``[defaults]`` (options and behaviour keys).
 
     Raises:
-        ConfigError: On the first invalid value, labelled ``[defaults]``.
+        ConfigError: On an unknown key or the first invalid value, labelled ``[defaults]``.
     """
+    _check_keys(defaults, DEFAULTS_KEYS, DEFAULTS_LABEL)
     _build_options(defaults, DEFAULTS_LABEL, base_dir, DEFAULT_TIMEOUT_MINUTES, protected_rules)
     _optional(defaults, "notify", lambda v: _parse_choice(v, DEFAULTS_LABEL, "notify", NOTIFY_POLICIES))
     _optional(defaults, "enabled", lambda v: _parse_bool(v, DEFAULTS_LABEL, "enabled"))
+
+
+def _build_ask_options(
+    ask: Mapping[str, Any],
+    default_options: Mapping[str, Any],
+    base_dir: Path,
+    protected_rules: tuple[str, ...],
+) -> RunOptions:
+    """Check ``[ask]``'s keys, then build its options on top of the inherited defaults.
+
+    Raises:
+        ConfigError: On an unknown key or an invalid value, labelled ``[ask]``.
+    """
+    _check_keys(ask, ASK_KEYS, ASK_LABEL)
+    return _build_options(
+        {**default_options, **ask}, ASK_LABEL, base_dir, DEFAULT_ASK_TIMEOUT_MINUTES, protected_rules
+    )
 
 
 def _parse_entry(entry: Any, index: int, *args: Any) -> Task:
@@ -486,9 +504,6 @@ def parse_task_config(
     _check_keys(data, TOP_LEVEL_KEYS, "tasks.toml: ")
     defaults = _as_table(data.get("defaults", {}), DEFAULTS_LABEL, "[defaults]")
     ask = _as_table(data.get("ask", {}), ASK_LABEL, "[ask]")
-    _check_keys(defaults, DEFAULTS_KEYS, DEFAULTS_LABEL)
-    _check_keys(ask, ASK_KEYS, ASK_LABEL)
-
     raw_tasks = data.get("task", [])
     if not isinstance(raw_tasks, list):
         raise _fail("tasks.toml: ", "'task' must be an array of tables written as [[task]].")
@@ -505,15 +520,7 @@ def parse_task_config(
 
     # Ask options inherit the option keys from [defaults] but keep their own timeout default.
     default_options = {key: value for key, value in inherited.items() if key in OPTION_KEYS}
-    ask_options = _capture(
-        errors,
-        _build_options,
-        {**default_options, **ask},
-        ASK_LABEL,
-        base_dir,
-        DEFAULT_ASK_TIMEOUT_MINUTES,
-        protected_rules,
-    )
+    ask_options = _capture(errors, _build_ask_options, ask, default_options, base_dir, protected_rules)
 
     now = datetime.now(timezone.utc)
     tasks: dict[str, Task] = {}
