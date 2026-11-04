@@ -145,8 +145,15 @@ class CronParsingTests(unittest.TestCase):
         self.assertEqual(schedule.months, frozenset({1}))
         self.assertEqual(schedule.weekdays, frozenset({0, 1, 2, 3, 4}))
 
-    def test_any_flags_only_for_a_plain_star(self) -> None:
+    def test_any_flags_are_set_for_fields_starting_with_a_star(self) -> None:
+        # Like Vixie cron: "*/2" counts as unrestricted for the OR rule.
         schedule = parse_schedule("0 0 */2 * 1")
+        self.assertTrue(schedule.day_of_month_any)
+        self.assertFalse(schedule.weekday_any)
+        self.assertTrue(parse_schedule("0 0 1 * */2").weekday_any)
+
+    def test_any_flags_are_clear_for_explicit_values(self) -> None:
+        schedule = parse_schedule("0 0 1-31 * 0-6")
         self.assertFalse(schedule.day_of_month_any)
         self.assertFalse(schedule.weekday_any)
 
@@ -392,6 +399,9 @@ class CronDescriptionTests(unittest.TestCase):
             "0 8 * 6 *",
             "0 8 1 6 *",
             "0 9 13 * fri",  # day-of-month and weekday both set: cron OR rule
+            "0 9 */2 * *",  # every second day, not every day
+            "0 9 1 * 0-6",  # an explicit weekday list triggers the OR rule: fires every day
+            "0 9 1-31 * mon",
         ):
             with self.subTest(expression=expression):
                 self.assertEqual(parse_schedule(expression).description, f"cron: {expression}")
@@ -435,6 +445,25 @@ class MatchesDayTests(unittest.TestCase):
             found,
             [at(2026, 11, 6, 9), at(2026, 11, 13, 9), at(2026, 11, 20, 9), at(2026, 11, 27, 9)],
         )
+
+    def test_star_step_day_field_combines_with_weekday_by_and(self) -> None:
+        # "*/2" is unrestricted for the OR rule: odd days that are Mondays, not odd days plus Mondays.
+        schedule = parse_schedule("0 9 */2 * 1")
+        found = next_times(schedule, at(2026, 11, 4), 8)
+        for moment in found:
+            with self.subTest(moment=moment):
+                self.assertEqual(moment.weekday(), 0)
+                self.assertEqual(moment.day % 2, 1)
+        self.assertEqual(found[:3], [at(2026, 11, 9, 9), at(2026, 11, 23, 9), at(2026, 12, 7, 9)])
+        self.assertTrue(schedule.matches_day(date(2026, 11, 9)))  # an odd Monday
+        self.assertFalse(schedule.matches_day(date(2026, 11, 16)))  # an even Monday
+        self.assertFalse(schedule.matches_day(date(2026, 11, 11)))  # an odd Wednesday
+
+    def test_star_step_weekday_field_combines_with_day_of_month_by_and(self) -> None:
+        schedule = parse_schedule("0 9 13 * */2")  # weekday set: Sun, Tue, Thu, Sat
+        self.assertFalse(schedule.matches_day(date(2026, 11, 13)))  # the 13th, a Friday
+        self.assertTrue(schedule.matches_day(date(2026, 6, 13)))  # the 13th, a Saturday
+        self.assertFalse(schedule.matches_day(date(2026, 6, 16)))  # a Tuesday, not the 13th
 
     def test_month_still_applies_with_the_or_rule(self) -> None:
         schedule = parse_schedule("0 9 13 jun fri")

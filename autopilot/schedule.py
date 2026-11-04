@@ -130,8 +130,9 @@ class Schedule:
         days_of_month: Allowed days of month, 1-31.
         months: Allowed months, 1-12.
         weekdays: Allowed weekdays, 0-6 with 0 = Monday (Python numbering).
-        day_of_month_any: True when the day-of-month field was ``*``.
-        weekday_any: True when the day-of-week field was ``*``.
+        day_of_month_any: True when the day-of-month field started with ``*``
+            (``*``, ``*/2``), which cron treats as unrestricted for the OR rule.
+        weekday_any: True when the day-of-week field started with ``*``.
 
     Example:
         >>> schedule = parse_schedule("daily 07:30")
@@ -560,8 +561,11 @@ def _parse_cron(expression: str, cron_text: str) -> Schedule:
         months=_parse_field(month_text, _MONTH_FIELD),
         # Cron counts 0 or 7 as Sunday and 1 as Monday; Python counts 0 as Monday.
         weekdays=frozenset((value + 6) % 7 for value in cron_weekdays),
-        day_of_month_any=day_text == "*",
-        weekday_any=weekday_text == "*",
+        # Like Vixie cron, a field that starts with "*" (even "*/2") counts as
+        # unrestricted, so "0 9 */2 * 1" means odd days that are Mondays (AND),
+        # not odd days plus every Monday (OR).
+        day_of_month_any=day_text.startswith("*"),
+        weekday_any=weekday_text.startswith("*"),
     )
     # The description depends on the parsed sets, so it is filled in afterwards.
     return replace(schedule, description=_describe_cron(schedule))
@@ -589,6 +593,7 @@ def _describe_cron(schedule: Schedule) -> str:
         schedule.minutes == frozenset({0})
         and schedule.hours == ALL_HOURS
         and schedule.day_of_month_any
+        and schedule.days_of_month == ALL_DAYS_OF_MONTH
         and schedule.weekdays == ALL_WEEKDAYS
     ):
         return "hourly"
@@ -596,11 +601,15 @@ def _describe_cron(schedule: Schedule) -> str:
         return fallback
     (hour,) = schedule.hours
     (minute,) = schedule.minutes
-    if schedule.day_of_month_any:
+    # Both the flag and the set are checked: "*/2" starts with "*" but still skips
+    # days, and an explicit "1-31" is a full set that still triggers the OR rule.
+    if schedule.day_of_month_any and schedule.days_of_month == ALL_DAYS_OF_MONTH:
         return _describe_daily(schedule.weekdays, hour, minute)
-    if len(schedule.days_of_month) == 1 and schedule.weekday_any:
-        # With a restricted weekday too, cron's OR rule applies, so only
-        # a "*" weekday field means "just that day of the month".
+    if (
+        len(schedule.days_of_month) == 1
+        and schedule.weekday_any
+        and schedule.weekdays == ALL_WEEKDAYS
+    ):
         (day,) = schedule.days_of_month
         return f"monthly on day {day} at {hour:02d}:{minute:02d}"
     return fallback
