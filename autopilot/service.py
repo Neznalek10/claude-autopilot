@@ -205,7 +205,7 @@ def linger_enabled(run: CommandRunner, user: str) -> bool | None:
         its answer can't be read.
 
     Example:
-        >>> linger_enabled(run_command, "alice")  # doctest: +SKIP
+        >>> linger_enabled(run_command, "user")  # doctest: +SKIP
         False
     """
     code, stdout, _ = run(

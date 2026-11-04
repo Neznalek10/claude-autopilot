@@ -348,8 +348,8 @@ class LingerEnabledTest(unittest.TestCase):
     def test_asks_loginctl_for_the_linger_property_of_the_user(self) -> None:
         """The query names the user and asks only for the Linger property."""
         run = FakeRunner(scripted={"show-user": (0, "Linger=yes\n", "")})
-        linger_enabled(run, "alice")
-        self.assertEqual(run.calls, [("loginctl", "show-user", "alice", "--property=Linger")])
+        linger_enabled(run, "user")
+        self.assertEqual(run.calls, [("loginctl", "show-user", "user", "--property=Linger")])
 
     def test_reports_true_and_false_from_the_linger_line(self) -> None:
         """A "yes" line means linger is on, a "no" line means it is off."""
@@ -357,17 +357,17 @@ class LingerEnabledTest(unittest.TestCase):
         for output, expected in cases.items():
             with self.subTest(output=output):
                 run = FakeRunner(scripted={"show-user": (0, output, "")})
-                self.assertIs(linger_enabled(run, "alice"), expected)
+                self.assertIs(linger_enabled(run, "user"), expected)
 
     def test_returns_none_when_loginctl_fails(self) -> None:
         """A failing loginctl gives an unknown answer, not a guess."""
         run = FakeRunner(scripted={"show-user": (FAILURE_EXIT_CODE, "", "No such user")})
-        self.assertIsNone(linger_enabled(run, "alice"))
+        self.assertIsNone(linger_enabled(run, "user"))
 
     def test_returns_none_when_the_output_has_no_linger_line(self) -> None:
         """Output without a recognizable Linger line gives an unknown answer."""
         run = FakeRunner(scripted={"show-user": (0, "Something=else\nLinger=maybe\n", "")})
-        self.assertIsNone(linger_enabled(run, "alice"))
+        self.assertIsNone(linger_enabled(run, "user"))
 
 
 if __name__ == "__main__":
