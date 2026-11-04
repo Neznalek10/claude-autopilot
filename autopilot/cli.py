@@ -22,11 +22,15 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import contextlib
+import io
 import os
+import signal
+import sqlite3
 import sys
 import threading
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -252,18 +256,79 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = build_parser().parse_args(argv)
     try:
-        settings = load_settings()
-        _configure_cli_logging(settings, args)
-        return args.handler(args, settings)
+        return _execute(args)
     except AutopilotError as err:
         print(f"{PROGRAM}: {err}", file=sys.stderr)
         # Tracebacks are for bug reports, so they are opt-in.
         if _debug_requested(args):
             traceback.print_exc(file=sys.stderr)
         return EXIT_FAILURE
+    except BrokenPipeError:
+        # The reader (for example `head`) went away: stop quietly.
+        _silence_stdout()
+        return EXIT_FAILURE
     except KeyboardInterrupt:
         print(file=sys.stderr)
         return EXIT_INTERRUPTED
+
+
+def _execute(args: argparse.Namespace) -> int:
+    """Load settings, configure logging and run the chosen command.
+
+    Raises:
+        AutopilotError: Expected failures, including database problems
+            (``sqlite3.Error`` is converted so the user sees one friendly line).
+    """
+    settings = load_settings()
+    _configure_cli_logging(settings, args)
+    try:
+        return args.handler(args, settings)
+    except sqlite3.Error as err:
+        raise AutopilotError(f"database error in {settings.db_path}: {err}") from err
+
+
+def _silence_stdout() -> None:
+    """Point stdout at /dev/null so the interpreter's exit flush cannot fail again.
+
+    This is the approach the Python documentation recommends after a
+    BrokenPipeError. It does nothing when stdout has no file descriptor
+    (for example when it is redirected to a StringIO).
+    """
+    try:
+        descriptor = sys.stdout.fileno()
+    except (AttributeError, ValueError, io.UnsupportedOperation):
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, descriptor)
+    os.close(devnull)
+
+
+@contextlib.contextmanager
+def _interrupt_on_termination() -> Iterator[None]:
+    """Turn SIGTERM and SIGHUP into KeyboardInterrupt while the block runs.
+
+    That lets the runner kill Claude's process group and the engine record the
+    run as interrupted, exactly as for Ctrl-C. Previous handlers are restored
+    afterwards. Handlers can only be installed on the main thread, so elsewhere
+    this does nothing.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def raise_interrupt(signum: int, frame: object) -> None:
+        """Signal handler: behave like Ctrl-C."""
+        raise KeyboardInterrupt
+
+    previous = {
+        signum: signal.signal(signum, raise_interrupt)
+        for signum in (signal.SIGTERM, signal.SIGHUP)
+    }
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def _debug_requested(args: argparse.Namespace) -> bool:
@@ -350,7 +415,8 @@ def _finish_one_off(app: App, run_id: int, label: str) -> int:
         AutopilotError: The run record disappeared.
     """
     print(f"Running {label}...", file=sys.stderr)
-    record = app.engine.execute_run(run_id)
+    with _interrupt_on_termination():
+        record = app.engine.execute_run(run_id)
     if record is None:
         raise AutopilotError(f"Run #{run_id} disappeared from the database.")
     if record.status == STATUS_SUCCESS:
@@ -501,7 +567,7 @@ def _run_details(record: RunRecord, settings: Settings) -> str:
         fields.append(("Blocked tools", ", ".join(record.denied_tools)))
     if record.retry_of is not None:
         fields.append(("Retry of", f"#{record.retry_of}"))
-    return "\n".join(f"{label + ':':<14}{value}" for label, value in fields)
+    return "\n".join(f"{label + ':':<15}{value}" for label, value in fields)
 
 
 def _cmd_pause(args: argparse.Namespace, settings: Settings) -> int:
@@ -526,10 +592,14 @@ def _set_paused(name: str, settings: Settings, *, paused: bool) -> int:
 def _cmd_next(args: argparse.Namespace, settings: Settings) -> int:
     """`next "<expr>"`: preview the next fire times in the configured timezone."""
     schedule = parse_schedule(args.expression)
+    # Compute everything first so a schedule that never fires prints nothing.
+    moments: list[datetime] = []
     moment = _now(settings)
-    print(f"Schedule: {schedule.description}")
     for _ in range(args.count):
         moment = schedule.next_after(moment)
+        moments.append(moment)
+    print(f"Schedule: {schedule.description}")
+    for moment in moments:
         print(f"  {_weekday(moment)} {moment.strftime(METADATA_TIME_FORMAT)}")
     return EXIT_OK
 

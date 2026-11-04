@@ -10,11 +10,17 @@ collaborators (``run_command``, ``default_unit_dir``, ``run_service``,
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import logging
 import os
 import re
+import signal
+import sqlite3
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -186,12 +192,129 @@ class ErrorHandlingTests(CliTestCase):
             code, _, _ = self.run_cli("doctor")
         self.assertEqual(code, 130)
 
+    def test_database_error_is_one_friendly_line(self) -> None:
+        """A sqlite3 failure names the database and exits 1 without a traceback."""
+        with mock.patch.object(Store, "list_runs", side_effect=sqlite3.DatabaseError("file is not a database")):
+            code, _, err = self.run_cli("history")
+        self.assertEqual(code, 1)
+        self.assertIn("autopilot: database error in", err)
+        self.assertIn("autopilot.db", err)
+        self.assertIn("file is not a database", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_data_dir_that_is_a_file_is_a_friendly_error(self) -> None:
+        """AUTOPILOT_DATA_DIR pointing at a file gives a one-line error."""
+        blocker = self.home / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        self.write_tasks()
+        with mock.patch.dict(os.environ, {"AUTOPILOT_DATA_DIR": str(blocker)}):
+            code, _, err = self.run_cli("list")
+        self.assertEqual(code, 1)
+        self.assertTrue(err.startswith("autopilot:"))
+        self.assertNotIn("Traceback", err)
+
+    def test_corrupt_database_is_a_friendly_error(self) -> None:
+        """A garbage autopilot.db is reported as a database error."""
+        data = self.home / "data"
+        data.mkdir()
+        (data / "autopilot.db").write_bytes(b"this is not a sqlite file" * 100)
+        code, _, err = self.run_cli("history")
+        self.assertEqual(code, 1)
+        self.assertIn("database error in", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_broken_pipe_exits_quietly(self) -> None:
+        """A reader that closes early ends the command with exit 1 and no output noise."""
+        with mock.patch.object(cli, "run_doctor", side_effect=BrokenPipeError):
+            code, _, err = self.run_cli("doctor")
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+
     def test_bad_environment_is_a_friendly_error(self) -> None:
         """An invalid setting stops the command with the settings message."""
         with mock.patch.dict(os.environ, {"AUTOPILOT_MAX_PARALLEL": "99"}):
             code, _, err = self.run_cli("list")
         self.assertEqual(code, 1)
         self.assertIn("AUTOPILOT_MAX_PARALLEL", err)
+
+
+class SubprocessTests(CliTestCase):
+    """Behaviour that needs a real process: signals and closed pipes."""
+
+    def start_cli(self, *argv: str, **popen: object) -> subprocess.Popen:
+        """Start ``python -m autopilot`` with the patched test environment."""
+        return subprocess.Popen(
+            [sys.executable, "-m", "autopilot", *argv],
+            env=os.environ.copy(),
+            text=True,
+            **popen,  # type: ignore[arg-type]
+        )
+
+    @staticmethod
+    def child_pids(parent: int) -> list[int]:
+        """Return the pids whose parent is ``parent`` (read from /proc)."""
+        found = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text(encoding="utf-8")
+            except OSError:
+                continue
+            # The command name sits in parentheses and may contain spaces.
+            if int(stat.rsplit(")", 1)[1].split()[1]) == parent:
+                found.append(int(entry.name))
+        return found
+
+    def wait_for_child(self, parent: int) -> int:
+        """Wait up to 15 s for the first child of ``parent`` and return its pid."""
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            children = self.child_pids(parent)
+            if children:
+                return children[0]
+            time.sleep(0.05)
+        self.fail("autopilot never started the Claude process")
+
+    def test_sigterm_and_sighup_end_a_run_cleanly(self) -> None:
+        """Termination signals kill Claude's process group, finish the run row and exit 130."""
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=signum.name):
+                self.write_tasks('[[task]]\nname = "slow"\nprompt = "FAKE_SLEEP 60"\n')
+                process = self.start_cli("run", "slow", "--no-notify", stderr=subprocess.DEVNULL)
+                self.addCleanup(process.kill)
+                child = self.wait_for_child(process.pid)
+                group = os.getpgid(child)
+                process.send_signal(signum)
+                self.assertEqual(process.wait(timeout=30), 130)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    try:
+                        os.killpg(group, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("Claude's process group is still alive")
+                record = self.store().list_runs(task_name="slow")[0]
+                self.assertTrue(record.is_finished, record.status)
+
+    def test_closed_pipe_exits_quietly(self) -> None:
+        """`autopilot show <id> | head -1` leaves no traceback and no interpreter warning."""
+        run_id = self.store().create_run(
+            task_name="news", trigger=TRIGGER_SCHEDULE, prompt="p", queued_at=datetime.now(TZ)
+        )
+        self.store().finish_run(
+            run_id, status="success", finished_at=datetime.now(TZ), result="line\n" * 400_000
+        )
+        process = self.start_cli("show", str(run_id), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(process.kill)
+        assert process.stdout is not None and process.stderr is not None
+        process.stdout.readline()
+        process.stdout.close()
+        self.assertEqual(process.wait(timeout=30), 1)
+        self.assertEqual(process.stderr.read(), "")
+        process.stderr.close()
 
 
 class InitTests(CliTestCase):
@@ -273,6 +396,13 @@ class NextTests(CliTestCase):
         self.assertEqual(out, "")
         self.assertIn("autopilot:", err)
         self.assertIn("whenever", err)
+
+    def test_next_never_firing_schedule_prints_nothing_to_stdout(self) -> None:
+        """A schedule that never fires reports the error without a half-printed preview."""
+        code, out, err = self.run_cli("next", "0 0 30 2 *")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("autopilot:", err)
 
     def test_next_needs_no_tasks_file(self) -> None:
         """The preview works without tasks.toml."""
@@ -449,6 +579,18 @@ class ListHistoryShowTests(CliTestCase):
         self.assertEqual(record.status, STATUS_ERROR)
         _, out, _ = self.run_cli("show", str(record.id))
         self.assertIn(record.error or "", out)
+
+    def test_show_labels_are_followed_by_a_space(self) -> None:
+        """Even the longest label ("Blocked tools:") is separated from its value."""
+        self.write_tasks()
+        self.run_cli("run", "news")
+        run_id = self.store().list_runs()[0].id
+        record = self.store().get_run(run_id)
+        assert record is not None
+        blocked = dataclasses.replace(record, denied_tools=("Bash",))
+        with mock.patch.object(Store, "get_run", return_value=blocked):
+            _, out, _ = self.run_cli("show", str(run_id))
+        self.assertIn("Blocked tools: Bash", out)
 
     def test_show_unknown_id(self) -> None:
         """An unknown id exits 1."""
