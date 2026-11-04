@@ -226,10 +226,11 @@ class BuildAppTests(AppTestCase):
             build_app(settings)
 
     def test_invalid_tasks_file_propagates(self) -> None:
-        """A missing or broken tasks.toml raises ConfigError."""
+        """A missing or broken tasks.toml raises ConfigError and leaves no database behind."""
         settings = self.make_settings()
         with self.assertRaises(ConfigError):
             build_app(settings)
+        self.assertFalse(settings.db_path.exists())
 
     def test_injected_runner_and_clock_are_used(self) -> None:
         """An injected runner skips the binary lookup and the clock reaches the engine."""
@@ -319,6 +320,29 @@ class RunServiceTests(AppTestCase):
             thread = self.start_in_thread(app, stop)
             thread.join(WAIT_SECONDS)
         self.assertFalse(thread.is_alive())
+
+    def test_second_instance_is_refused_while_the_first_runs(self) -> None:
+        """A second service on the same data folder fails fast and does not touch the first one's runs."""
+        settings = self.make_settings()
+        self.write_tasks(settings)
+        first, second = build_app(settings), build_app(settings)
+        stop = threading.Event()
+        thread = self.start_in_thread(first, stop)
+        lock = settings.data_dir / "autopilot.lock"
+        try:
+            self.wait_for(lock.exists)
+            time.sleep(0.2)
+            with self.assertRaises(AutopilotError) as caught:
+                run_service(second, threading.Event())
+            self.assertIn("already running", str(caught.exception))
+            self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+        finally:
+            stop.set()
+            thread.join(WAIT_SECONDS)
+        # Once the first one has stopped the lock is free again.
+        again = threading.Event()
+        again.set()
+        run_service(second, again)
 
     def test_main_thread_installs_and_restores_signal_handlers(self) -> None:
         """On the main thread SIGTERM sets stop during the run and the old handler returns after."""
@@ -568,6 +592,16 @@ class TelegramSetupTests(AppTestCase):
         fake.raise_on_updates = TelegramError("boom", status=500)
         with self.assertRaises(TelegramError):
             self.run_setup(self.make_settings(), fake)
+
+    def test_token_prompt_without_terminal_is_a_friendly_error(self) -> None:
+        """EOF at the token prompt becomes an AutopilotError, not a traceback."""
+        def no_terminal(prompt: str) -> str:
+            """Behave like getpass with stdin closed."""
+            raise EOFError
+
+        with self.assertRaises(AutopilotError) as caught:
+            self.run_setup(self.make_settings(), FakeTelegramClient(), secret_input=no_terminal)
+        self.assertIn("interactive terminal", str(caught.exception))
 
     def test_bad_token_is_rejected_before_saving(self) -> None:
         """A malformed token fails validation and is never written to .env."""

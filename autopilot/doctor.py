@@ -62,6 +62,9 @@ FIX_INDENT = "    "
 
 FIX_INSTALL_CLAUDE = "Install Claude Code (`claude install`) or set CLAUDE_BIN in .env."
 FIX_LOGIN = "Run `claude auth login` and sign in with your Claude subscription."
+TASKS_PREFIX = "tasks.toml: "
+TASKS_NAME_PREFIX = "tasks.toml "
+FIX_CLI_FIRST = "Fix the Claude CLI check above first."
 FIX_TASKS = "Edit tasks.toml, then run `autopilot validate`."
 FIX_TASKS_MISSING = "Run `autopilot init` to create it."
 FIX_TELEGRAM = "Run `autopilot telegram-setup`."
@@ -88,7 +91,7 @@ class CheckResult:
 
 def _skipped(name: str) -> CheckResult:
     """Build the result for a check that needs the Claude binary when it is missing."""
-    return CheckResult(name, STATUS_WARN, "skipped (Claude CLI not found)")
+    return CheckResult(name, STATUS_WARN, "skipped (Claude CLI not found)", FIX_CLI_FIRST)
 
 
 def check_claude_binary(settings: Settings, run: CommandRunner) -> tuple[CheckResult, Path | None]:
@@ -176,7 +179,7 @@ def check_api_key(env: Mapping[str, str]) -> CheckResult:
     return CheckResult(
         name,
         STATUS_WARN,
-        f"{', '.join(present)} is set; autopilot removes it from Claude runs so your subscription is used",
+        f"{', '.join(present)} {'is' if len(present) == 1 else 'are'} set; autopilot removes it from Claude runs so your subscription is used",
         "Unset it if you want plain `claude` in this shell to use your subscription too.",
     )
 
@@ -195,7 +198,8 @@ def check_tasks(settings: Settings) -> CheckResult:
         config = load_task_config(settings.tasks_file)
     except AutopilotError as err:
         fix = FIX_TASKS if settings.tasks_file.is_file() else FIX_TASKS_MISSING
-        return CheckResult(name, STATUS_FAIL, str(err), fix)
+        # Messages start with "tasks.toml: " or "tasks.toml not found"; the report adds the name once.
+        return CheckResult(name, STATUS_FAIL, str(err).removeprefix(TASKS_PREFIX).removeprefix(TASKS_NAME_PREFIX), fix)
     enabled = sum(1 for task in config.tasks.values() if task.enabled)
     return CheckResult(name, STATUS_OK, f"{len(config.tasks)} tasks ({enabled} enabled)")
 
@@ -233,18 +237,18 @@ def check_data_dir(settings: Settings) -> CheckResult:
         settings: Provides the data folder.
 
     Returns:
-        ok when writable, warn when it will be created on first start, fail otherwise.
+        ok when writable or creatable on first start, fail otherwise.
     """
     name = "Data folder"
     data_dir = settings.data_dir
     if data_dir.exists():
         if data_dir.is_dir() and os.access(data_dir, os.W_OK | os.X_OK):
             return CheckResult(name, STATUS_OK, f"{data_dir} is writable")
-        return CheckResult(name, STATUS_FAIL, f"{data_dir} is not a writable folder", f"Fix its permissions: chmod u+rwx {data_dir}")
+        return CheckResult(name, STATUS_FAIL, f"{data_dir} is not a writable folder", f"Run `chmod u+rwx {data_dir}` (or remove it if it is a file).")
     # Not created yet: look for the nearest existing parent to see whether creation can work.
     parent = next((p for p in data_dir.parents if p.exists()), None)
     if parent is not None and os.access(parent, os.W_OK | os.X_OK):
-        return CheckResult(name, STATUS_WARN, f"{data_dir} does not exist yet, it will be created on first start")
+        return CheckResult(name, STATUS_OK, f"{data_dir} does not exist yet, it will be created on first start")
     return CheckResult(name, STATUS_FAIL, f"{data_dir} cannot be created", "Set AUTOPILOT_DATA_DIR to a folder you can write to.")
 
 
@@ -262,7 +266,7 @@ def check_service(run: CommandRunner, user: str) -> CheckResult:
     name = "Service"
     code, stdout, _ = run(["systemctl", "--user", "is-enabled", UNIT_NAME], COMMAND_TIMEOUT_SECONDS)
     if code in (EXIT_TIMED_OUT, EXIT_NOT_EXECUTABLE, EXIT_NOT_FOUND):
-        return CheckResult(name, STATUS_WARN, "systemd is not available here, run `autopilot start` by hand")
+        return CheckResult(name, STATUS_WARN, "systemd is not available here", "Run `autopilot start` in a terminal instead.")
     enabled = stdout.strip() == "enabled"
     if not enabled:
         return CheckResult(name, STATUS_WARN, "not installed (fine if you run `autopilot start` yourself)", FIX_SERVICE)

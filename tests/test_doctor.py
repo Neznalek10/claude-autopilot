@@ -178,6 +178,12 @@ class ApiKeyTests(unittest.TestCase):
         self.assertIn("ANTHROPIC_API_KEY", result.detail)
         self.assertNotIn("sk-secret-value", result.detail + result.fix)
 
+    def test_several_variables_use_plural_verb(self) -> None:
+        """Two variables read "are set", one reads "is set"."""
+        both = check_api_key({"ANTHROPIC_API_KEY": "a", "ANTHROPIC_AUTH_TOKEN": "b"})
+        self.assertIn("ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN are set", both.detail)
+        self.assertIn("ANTHROPIC_API_KEY is set", check_api_key({"ANTHROPIC_API_KEY": "a"}).detail)
+
     def test_auth_token_warns_and_empty_value_is_ignored(self) -> None:
         """The auth token variable warns too; an empty value counts as unset."""
         self.assertEqual(check_api_key({"ANTHROPIC_AUTH_TOKEN": "x"}).status, "warn")
@@ -199,6 +205,7 @@ class TasksTests(DoctorTestCase):
         result = check_tasks(self.make_settings())
         self.assertEqual(result.status, "fail")
         self.assertIn("autopilot init", result.detail)
+        self.assertNotIn("tasks.toml: tasks.toml", format_report([result]))
         self.assertEqual(result.fix, "Run `autopilot init` to create it.")
 
     def test_invalid_file_fails_naming_the_field(self) -> None:
@@ -208,6 +215,7 @@ class TasksTests(DoctorTestCase):
         result = check_tasks(settings)
         self.assertEqual(result.status, "fail")
         self.assertIn("shedule", result.detail)
+        self.assertNotIn("tasks.toml: tasks.toml", format_report([result]))
         self.assertIn("autopilot validate", result.fix)
 
 
@@ -272,17 +280,20 @@ class DataDirTests(DoctorTestCase):
         settings.data_dir.mkdir()
         self.assertEqual(check_data_dir(settings).status, "ok")
 
-    def test_missing_folder_with_writable_parent_warns(self) -> None:
-        """A folder that does not exist yet is a warning, because start creates it."""
+    def test_missing_folder_with_writable_parent_is_ok(self) -> None:
+        """A folder that does not exist yet is fine, because start creates it."""
         result = check_data_dir(self.make_settings())
-        self.assertEqual(result.status, "warn")
+        self.assertEqual(result.status, "ok")
         self.assertIn("created", result.detail)
 
     def test_file_in_place_of_folder_fails(self) -> None:
         """A regular file where the folder should be fails."""
         settings = self.make_settings()
         settings.data_dir.write_text("x")
-        self.assertEqual(check_data_dir(settings).status, "fail")
+        result = check_data_dir(settings)
+        self.assertEqual(result.status, "fail")
+        self.assertIn(f"chmod u+rwx {settings.data_dir}", result.fix)
+        self.assertNotIn("Fix its", result.fix)
 
     @unittest.skipIf(os.geteuid() == 0, "root ignores permission bits")
     def test_read_only_parent_fails(self) -> None:
@@ -337,6 +348,7 @@ class ServiceTests(unittest.TestCase):
         result = check_service(ScriptedRunner({"is-enabled autopilot.service": (127, "", "missing")}), "user")
         self.assertEqual(result.status, "warn")
         self.assertIn("not available", result.detail)
+        self.assertTrue(result.fix)
 
     def test_unknown_linger_does_not_block_ok(self) -> None:
         """When loginctl cannot answer, an active service is still ok."""
@@ -405,7 +417,15 @@ class RunDoctorTests(DoctorTestCase):
         for name in ("Claude login", "Live call"):
             self.assertEqual(by_name[name].status, "warn")
             self.assertIn("skipped", by_name[name].detail)
+            self.assertIn("Fix the Claude CLI check above first", by_name[name].fix)
         self.assertEqual(by_name["Claude CLI"].status, "fail")
+
+    def test_every_warning_and_failure_has_a_fix(self) -> None:
+        """No warn or fail result in a typical broken setup lacks a Fix line."""
+        settings = self.make_settings(CLAUDE_BIN=str(self.home / "nope"))
+        for result in self.run_all(settings, live=True):
+            if result.status != "ok":
+                self.assertTrue(result.fix, f"{result.name} has no fix")
 
     def test_report_format_and_summary(self) -> None:
         """Marks, indented fixes and the summary line follow the contract."""

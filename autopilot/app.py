@@ -18,6 +18,7 @@ Invariants:
 
 from __future__ import annotations
 
+import fcntl
 import getpass
 import logging
 import logging.handlers
@@ -38,7 +39,7 @@ from autopilot.bot import OFFSET_KEY, TelegramBot, TelegramNotifier
 from autopilot.engine import Engine, LogNotifier
 from autopilot.errors import AutopilotError, TelegramError
 from autopilot.formatting import format_time
-from autopilot.models import Notifier, Runner
+from autopilot.models import Notifier, Runner, TaskConfig
 from autopilot.runner import ClaudeRunner, find_claude_binary
 from autopilot.settings import (
     DEFAULT_TASKS_FILE_NAME,
@@ -70,6 +71,9 @@ PRIVATE_CHAT_TYPE = "private"
 CONFIRM_PROMPT = "Use this chat? [y/N] "
 CONFIRM_YES = ("y", "yes")
 CODE_DIGITS = 6
+LOCK_FILE_NAME = "autopilot.lock"
+LOCK_FILE_MODE = 0o600
+NO_TOKEN_TERMINAL_MESSAGE = "telegram-setup needs an interactive terminal to read the bot token."
 NO_TERMINAL_MESSAGE = "telegram-setup needs an interactive terminal to confirm the chat."
 DATA_DIR_MODE = 0o700
 LOG_FILE_MODE = 0o600
@@ -239,6 +243,17 @@ def build_app(
     if runner is None:
         find_claude_binary(settings.claude_bin)
         runner = ClaudeRunner(lambda: find_claude_binary(settings.claude_bin), clock=now)
+
+    def load_config() -> TaskConfig:
+        """Parse tasks.toml, denying Claude access to the secret-bearing files."""
+        # .env holds the bot token; the data folder holds the chat history (database,
+        # its -wal and -shm files) and the log. Claude must not read any of them.
+        return load_task_config(
+            settings.tasks_file, protected_paths=(settings.env_file, settings.data_dir / "**")
+        )
+
+    # Validate first so a broken setup fails before any database file is created.
+    load_config()
     store = Store(settings.db_path)
 
     telegram_client: TelegramClient | None = None
@@ -255,11 +270,7 @@ def build_app(
         store=store,
         runner=runner,
         notifier=notifier,
-        # .env holds the bot token; the data folder holds the chat history (database,
-        # its -wal and -shm files) and the log. Claude must not read any of them.
-        config_loader=lambda: load_task_config(
-            settings.tasks_file, protected_paths=(settings.env_file, settings.data_dir / "**")
-        ),
+        config_loader=load_config,
         clock=now,
         tasks_file=settings.tasks_file,
         max_parallel=settings.max_parallel,
@@ -275,10 +286,51 @@ def build_app(
 def run_service(app: App, stop: threading.Event) -> None:
     """Run the service until ``stop`` is set (or SIGTERM/SIGINT arrives).
 
+    Only one service may run per data folder: an exclusive lock on
+    ``<data_dir>/autopilot.lock`` is held for the whole life of this call.
+
     Args:
         app: The wired application.
         stop: Event that ends the loop; set by the signal handlers on the main thread.
+
+    Raises:
+        AutopilotError: Another autopilot process already holds the lock.
     """
+    lock_fd = _acquire_instance_lock(app.settings)
+    try:
+        _serve(app, stop)
+    finally:
+        # Closing the descriptor releases the lock.
+        os.close(lock_fd)
+
+
+def _acquire_instance_lock(settings: Settings) -> int:
+    """Take the exclusive, non-blocking single-instance lock.
+
+    Args:
+        settings: Provides the data folder and home (for the message).
+
+    Returns:
+        The open file descriptor holding the lock; close it to release.
+
+    Raises:
+        AutopilotError: When another process holds the lock.
+    """
+    settings.data_dir.mkdir(parents=True, exist_ok=True, mode=DATA_DIR_MODE)
+    descriptor = os.open(settings.data_dir / LOCK_FILE_NAME, os.O_RDWR | os.O_CREAT, LOCK_FILE_MODE)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        raise AutopilotError(
+            f"Autopilot is already running for {settings.home}. "
+            "Stop the other `autopilot start` or the service first."
+        ) from None
+    return descriptor
+
+
+def _serve(app: App, stop: threading.Event) -> None:
+    """Install signal handlers, start the bot and run the engine until ``stop`` is set."""
     on_main_thread = threading.current_thread() is threading.main_thread()
     previous: dict[int, object] = {}
     if on_main_thread:
@@ -353,7 +405,7 @@ def telegram_setup(
         TelegramError: Telegram rejected a call.
     """
     out = sys.stdout if out is None else out
-    token = settings.telegram_token or secret_input(TOKEN_PROMPT).strip()
+    token = settings.telegram_token or _read_token(secret_input)
     client = client_factory(token)
     username = client.get_me().get("username", "")
     # Saved only after getMe accepted it, so a typo never lands in .env.
@@ -377,6 +429,14 @@ def telegram_setup(
     client.send_message(chat_id, SETUP_DONE_TEXT, parse_mode=None)
     out.write(f"Connected. Saved TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to {settings.env_file}.\n")
     return chat_id
+
+
+def _read_token(secret_input: Callable[[str], str]) -> str:
+    """Ask for the bot token; EOF (no terminal) becomes a friendly error."""
+    try:
+        return secret_input(TOKEN_PROMPT).strip()
+    except EOFError:
+        raise AutopilotError(NO_TOKEN_TERMINAL_MESSAGE) from None
 
 
 def _get_updates(client: TelegramClient, offset: int | None, timeout: int) -> list[dict]:
