@@ -680,8 +680,9 @@ class AC6UsageLimitTests(IntegrationCase):
         wrapper = self.write_script("claude-limit", LIMIT_WRAPPER, fake=str(FAKE_CLAUDE))
         app = self.build(TWO_MANUAL_TASKS_TOML, claude=wrapper)
         engine = app.engine
-        first = engine.enqueue_task("alpha", TRIGGER_MANUAL)
-        second = engine.enqueue_task("beta", TRIGGER_MANUAL)
+        # Runs started from Telegram retry in the background; CLI (manual) runs never do.
+        first = engine.enqueue_task("alpha", TRIGGER_TELEGRAM)
+        second = engine.enqueue_task("beta", TRIGGER_TELEGRAM)
         engine.start_workers()
         self.wait_until(lambda: not app.store.active_runs(), "both runs to be held")
 
@@ -1030,7 +1031,7 @@ class AC11DoctorTests(IntegrationCase):
 
     def command_runner(self, args: Any, timeout: float = 20.0) -> tuple[int, str, str]:
         """Run the fake Claude for real and pretend systemd is unavailable."""
-        if str(args[0]) == str(FAKE_CLAUDE):
+        if str(FAKE_CLAUDE) in map(str, args):
             return run_command(args, timeout)
         return 127, "", "not available in tests"
 
