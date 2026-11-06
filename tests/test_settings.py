@@ -35,7 +35,7 @@ class LoadSettingsTest(unittest.TestCase):
 
     def load(self, env: dict[str, str] | None = None, **kwargs) -> Settings:
         """Load settings for the temp home with an explicit environment."""
-        return load_settings(env or {"AUTOPILOT_TIMEZONE": "Europe/Prague"}, home=self.home, **kwargs)
+        return load_settings(env or {"AUTOPILOT_TIMEZONE": "Europe/Berlin"}, home=self.home, **kwargs)
 
     def test_defaults(self) -> None:
         """With nothing set, paths derive from home and limits use defaults."""
@@ -49,7 +49,7 @@ class LoadSettingsTest(unittest.TestCase):
         self.assertEqual(settings.log_level, "INFO")
         self.assertIsNone(settings.claude_bin)
         self.assertFalse(settings.telegram_enabled)
-        self.assertEqual(settings.timezone, ZoneInfo("Europe/Prague"))
+        self.assertEqual(settings.timezone, ZoneInfo("Europe/Berlin"))
 
     def test_relative_and_tilde_paths(self) -> None:
         """Relative values resolve against home and ~ expands."""
@@ -193,7 +193,7 @@ class ResolveTimezoneTest(unittest.TestCase):
 
     def test_tz_variable(self) -> None:
         """A valid TZ value is used, including a leading colon."""
-        self.assertEqual(self.resolve(env_tz=":Europe/Prague"), ZoneInfo("Europe/Prague"))
+        self.assertEqual(self.resolve(env_tz=":Europe/Berlin"), ZoneInfo("Europe/Berlin"))
 
     def test_invalid_tz_variable_falls_through(self) -> None:
         """An invalid TZ is skipped in favour of the next source."""
@@ -207,8 +207,8 @@ class ResolveTimezoneTest(unittest.TestCase):
 
     def test_timezone_file(self) -> None:
         """/etc/timezone content is used when there is no symlink."""
-        self.timezone_file.write_text("Europe/Prague\n", encoding="utf-8")
-        self.assertEqual(self.resolve(), ZoneInfo("Europe/Prague"))
+        self.timezone_file.write_text("Europe/Berlin\n", encoding="utf-8")
+        self.assertEqual(self.resolve(), ZoneInfo("Europe/Berlin"))
 
     def test_utc_fallback_logs_warning(self) -> None:
         """Nothing usable gives UTC and a warning."""
@@ -251,7 +251,7 @@ class SetEnvValueTest(unittest.TestCase):
         """Values with spaces, quotes and # are quoted so dotenv reads them back."""
         from dotenv import dotenv_values
 
-        value = "it's a #value with \\ and ž"
+        value = "it's a #value with \\ and é"
         set_env_value(self.env_file, "CLAUDE_BIN", value)
         self.assertEqual(dotenv_values(self.env_file)["CLAUDE_BIN"], value)
 

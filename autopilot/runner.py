@@ -102,7 +102,7 @@ RATE_LIMIT_RE = re.compile(
 # Matches the machine-readable reset time "...limit reached|1760000000" (epoch seconds).
 RESET_EPOCH_RE = re.compile(r"\|(\d{10})\b")
 # A zone name in parentheses right after the reset time: an IANA name such as
-# " (Europe/Prague)", or the slash-less " (UTC)" / " (GMT)".
+# " (Europe/Berlin)", or the slash-less " (UTC)" / " (GMT)".
 RESET_ZONE_RE = re.compile(r"\s*\((?P<zone>[A-Za-z]+(?:/[A-Za-z0-9_+-]+)+|UTC|GMT)\)")
 # Matches a human reset time such as "resets 5pm", "resets at 5:30 pm", "reset 17:00",
 # optionally preceded by a month and day ("resets Nov 7, 9am", "resets Nov 7 at 9:30am")

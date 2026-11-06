@@ -141,13 +141,13 @@ class SuccessTests(unittest.TestCase):
     def test_send_message_payload_defaults(self) -> None:
         """send_message uses HTML, turns link previews off and returns the message."""
         client, fake = make_client(ok_body({"message_id": 5}))
-        result = client.send_message(-42, "<b>Příliš</b>")
+        result = client.send_message(-42, "<b>Naïve</b>")
         self.assertEqual(result, {"message_id": 5})
         self.assertEqual(
             fake.last_payload,
             {
                 "chat_id": -42,
-                "text": "<b>Příliš</b>",
+                "text": "<b>Naïve</b>",
                 "parse_mode": "HTML",
                 "link_preview_options": {"is_disabled": True},
                 "disable_notification": False,
@@ -198,7 +198,7 @@ class DocumentTests(unittest.TestCase):
     def test_multipart_body_has_fields_and_file(self) -> None:
         """Fields, caption and the raw file bytes appear in the multipart body."""
         client, fake = make_client(ok_body({"message_id": 8}))
-        content = "# Výsledek\nPříliš žluťoučký kůň".encode("utf-8") + b"\x00\xff"
+        content = "# Výsledek\nNaïve café résumé ☕".encode("utf-8") + b"\x00\xff"
         result = client.send_document(
             77, "news-run1.md", content, caption="<b>Full</b>", disable_notification=True
         )

@@ -142,7 +142,7 @@ Settings come from `.env` in the project folder and from the real environment. A
 | `AUTOPILOT_HOME` | the project folder | Project home folder. Read from the real environment only, not from `.env`. |
 | `AUTOPILOT_TASKS_FILE` | `tasks.toml` in the home folder | Path to the task file. |
 | `AUTOPILOT_DATA_DIR` | `data/` in the home folder | Folder for `autopilot.db` and `autopilot.log`. |
-| `AUTOPILOT_TIMEZONE` | the system time zone | IANA time zone for schedules, for example `Europe/Prague`. |
+| `AUTOPILOT_TIMEZONE` | the system time zone | IANA time zone for schedules, for example `Europe/Berlin`. |
 | `AUTOPILOT_MAX_PARALLEL` | `1` | Runs that may execute at the same time, from 1 to 4. Keep it at 1 if you chat with the bot: with more workers, quick chat messages can be answered out of order. |
 | `AUTOPILOT_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 | `CLAUDE_BIN` | found automatically | Full path to the Claude Code binary, if autodetection fails. |
@@ -335,3 +335,7 @@ claude-autopilot/
 ```
 
 `data/`, `workspace/`, `tasks.toml`, `.env` and `venv/` are created locally and are git-ignored.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

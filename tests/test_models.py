@@ -200,8 +200,8 @@ class TaskNotFoundErrorTest(unittest.TestCase):
 
     def test_unicode_task_names_are_kept_intact(self) -> None:
         """Non-ASCII names are shown exactly, with no escaping or mangling."""
-        error = TaskNotFoundError("Příliš", ["žluťoučký"])
-        expected = "Unknown task 'Příliš'. Known tasks: žluťoučký"
+        error = TaskNotFoundError("Naïve", ["café"])
+        expected = "Unknown task 'Naïve'. Known tasks: café"
         self.assertEqual(str(error), expected)
 
 

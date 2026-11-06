@@ -2,7 +2,7 @@
 
 Covers cron parsing (lists, ranges, steps, names, Sunday as 0 and 7, error
 cases), aliases, every friendly form, descriptions, the day-of-month /
-day-of-week OR rule, next_after in Europe/Prague including both DST changes of
+day-of-week OR rule, next_after in Europe/Berlin including both DST changes of
 2026, and impossible schedules.
 
 All times are fixed and aware (TZ from helpers.py); nothing reads the real clock.
@@ -24,7 +24,7 @@ from helpers import TZ
 
 UTC = timezone.utc
 
-# 2026-03-29 02:00 -> 03:00 in Prague (spring forward); 2026-10-25 03:00 -> 02:00 (fall back).
+# 2026-03-29 02:00 -> 03:00 in Berlin (spring forward); 2026-10-25 03:00 -> 02:00 (fall back).
 SPRING_FORWARD_DAY = date(2026, 3, 29)
 FALL_BACK_DAY = date(2026, 10, 25)
 
@@ -51,7 +51,7 @@ class CountingZone(tzinfo):
 
 
 def at(year: int, month: int, day: int, hour: int = 0, minute: int = 0, fold: int = 0) -> datetime:
-    """Build an aware Prague datetime for a test.
+    """Build an aware Berlin datetime for a test.
 
     Args:
         year: Calendar year.
@@ -62,7 +62,7 @@ def at(year: int, month: int, day: int, hour: int = 0, minute: int = 0, fold: in
         fold: 1 selects the second pass of an ambiguous fall-back time.
 
     Returns:
-        The datetime in Europe/Prague.
+        The datetime in Europe/Berlin.
     """
     return datetime(year, month, day, hour, minute, tzinfo=TZ, fold=fold)
 
@@ -204,7 +204,7 @@ class CronParsingTests(unittest.TestCase):
 
     def test_unicode_input_is_rejected_cleanly(self) -> None:
         with self.assertRaises(ScheduleError):
-            parse_schedule("Příliš žluťoučký kůň")
+            parse_schedule("Naïve café résumé ☕")
         with self.assertRaises(ScheduleError):
             parse_schedule("٣٠ * * * *")  # Arabic-Indic digits are not cron numbers.
 
@@ -582,7 +582,7 @@ class NextAfterTests(unittest.TestCase):
 
 
 class DaylightSavingTests(unittest.TestCase):
-    """next_after around the two 2026 DST changes in Europe/Prague."""
+    """next_after around the two 2026 DST changes in Europe/Berlin."""
 
     def test_spring_forward_skips_a_time_that_does_not_exist(self) -> None:
         schedule = parse_schedule("30 2 * * *")

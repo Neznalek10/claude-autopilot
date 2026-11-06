@@ -286,7 +286,7 @@ def format_time(moment: datetime | None, now: datetime) -> str:
         ValueError: If either datetime is naive.
 
     Example:
-        With ``now`` in Europe/Prague (+01:00), 05:30 UTC on the same day
+        With ``now`` in Europe/Berlin (+01:00), 05:30 UTC on the same day
         reads "06:30".
     """
     if moment is None:

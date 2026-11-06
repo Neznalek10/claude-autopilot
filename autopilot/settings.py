@@ -45,7 +45,7 @@ DEFAULT_LOG_LEVEL = "INFO"
 
 ENV_FILE_MODE = 0o600
 
-# Marker in the /etc/localtime symlink target, e.g. /usr/share/zoneinfo/Europe/Prague.
+# Marker in the /etc/localtime symlink target, e.g. /usr/share/zoneinfo/Europe/Berlin.
 ZONEINFO_MARKER = "zoneinfo/"
 
 # Names accepted by set_env_value: upper-case letters, digits and underscores, starting with a letter.
@@ -291,11 +291,11 @@ def resolve_timezone(
         if zone is None:
             raise ConfigError(
                 f"AUTOPILOT_TIMEZONE '{name}' is not a known time zone. "
-                "Use an IANA name such as Europe/Prague or America/New_York."
+                "Use an IANA name such as Europe/Berlin or America/New_York."
             )
         return zone
 
-    # TZ may carry a leading colon (":Europe/Prague"), which POSIX allows.
+    # TZ may carry a leading colon (":Europe/Berlin"), which POSIX allows.
     candidates = (
         _zone_or_none(env_tz.strip().lstrip(":")) if env_tz else None,
         _zone_from_localtime(localtime),

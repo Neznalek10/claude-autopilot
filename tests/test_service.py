@@ -167,8 +167,8 @@ class RenderUnitTest(unittest.TestCase):
 
     def test_unicode_project_path_is_written_unchanged(self) -> None:
         """A non-ASCII project folder is written as-is, so the service starts in the right place."""
-        text = self.render(home="/home/u/Příliš žluťoučký kůň")
-        self.assertIn("WorkingDirectory=/home/u/Příliš žluťoučký kůň", text)
+        text = self.render(home="/home/u/Naïve café résumé ☕")
+        self.assertIn("WorkingDirectory=/home/u/Naïve café résumé ☕", text)
 
     def test_newline_in_a_value_is_rejected(self) -> None:
         """A line break in any value would inject unit directives, so rendering refuses it."""

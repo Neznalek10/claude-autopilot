@@ -131,8 +131,8 @@ class EscapeTests(unittest.TestCase):
         self.assertEqual(escape_html('say "x"', quote=True), "say &quot;x&quot;")
 
     def test_unicode_is_untouched(self) -> None:
-        """Czech text passes through."""
-        self.assertEqual(escape_html("Příliš žluťoučký kůň"), "Příliš žluťoučký kůň")
+        """Accented text passes through."""
+        self.assertEqual(escape_html("Naïve café résumé ☕"), "Naïve café résumé ☕")
 
 
 class MarkdownBlockTests(unittest.TestCase):
@@ -267,9 +267,9 @@ class MarkdownInlineTests(unittest.TestCase):
         assert_valid_telegram_html(self, html)
 
     def test_unicode_survives(self) -> None:
-        """Czech text with formatting converts cleanly."""
-        html = markdown_to_telegram_html("**Příliš** žluťoučký `kůň`")
-        self.assertEqual(html, "<b>Příliš</b> žluťoučký <code>kůň</code>")
+        """Accented text with formatting converts cleanly."""
+        html = markdown_to_telegram_html("**Naïve** café `résumé`")
+        self.assertEqual(html, "<b>Naïve</b> café <code>résumé</code>")
 
     def test_stray_nul_characters_are_removed(self) -> None:
         """NUL (used internally for placeholders) in input can't forge placeholders."""
@@ -370,7 +370,7 @@ class SplitTests(unittest.TestCase):
         """Seeded fuzz: any mix of markers yields valid chunks within the limit."""
         pieces = [
             "**", "*", "_", "__", "~~", "`", "```", "\n", "\n\n", "- ", "# ", "|", "---",
-            "[a](https://x.org/_q_)", "[b](", ")", "<", ">", "&", '"', "word", " ", "kůň", "snake_case",
+            "[a](https://x.org/_q_)", "[b](", ")", "<", ">", "&", '"', "word", " ", "résumé", "snake_case",
         ]
         rng = random.Random(20261102)
         for _ in range(300):
@@ -445,12 +445,12 @@ class DurationAndTimeTests(unittest.TestCase):
         self.assertEqual(format_time(datetime(2026, 11, 9, 7, 30, tzinfo=TZ), NOW), "2026-11-09 07:30")
 
     def test_format_time_converts_fixed_utc_offset_to_local_wall_clock(self) -> None:
-        """05:30 UTC on the same day, seen from Prague (CET, +01:00), reads 06:30."""
+        """05:30 UTC on the same day, seen from Berlin (CET, +01:00), reads 06:30."""
         utc_moment = datetime(2026, 11, 2, 5, 30, tzinfo=timezone.utc)
         self.assertEqual(format_time(utc_moment, NOW), "06:30")
 
     def test_format_time_conversion_can_change_the_day(self) -> None:
-        """23:30 UTC the day before is already today in Prague."""
+        """23:30 UTC the day before is already today in Berlin."""
         moment = datetime(2026, 11, 1, 23, 30, tzinfo=timezone.utc)
         self.assertEqual(format_time(moment, NOW), "00:30")
 

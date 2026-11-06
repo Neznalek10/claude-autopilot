@@ -28,7 +28,7 @@ from autopilot.store import INTERRUPTED_MESSAGE, Store
 from helpers import TZ
 
 NOW = datetime(2026, 11, 2, 7, 30, tzinfo=TZ)
-UNICODE_TEXT = "Příliš žluťoučký kůň"
+UNICODE_TEXT = "Naïve café résumé ☕"
 
 
 class StoreTestCase(unittest.TestCase):
@@ -152,7 +152,7 @@ class RunLifecycleTests(StoreTestCase):
             self.new_run(queued_at=datetime(2026, 11, 2, 7, 30))
 
     def test_unicode_prompt_result_and_error_round_trip(self) -> None:
-        """Czech diacritics survive storage unchanged."""
+        """Accented text survive storage unchanged."""
         run_id = self.new_run(prompt=UNICODE_TEXT)
         self.finish(run_id, STATUS_ERROR, result=UNICODE_TEXT, error=UNICODE_TEXT)
         record = self.store.get_run(run_id)
@@ -171,8 +171,8 @@ class DatetimeTests(StoreTestCase):
     """Aware datetimes survive storage."""
 
     def test_non_utc_zone_round_trips_to_same_instant_and_offset(self) -> None:
-        """A Prague time comes back as the same instant with the same offset."""
-        summer = datetime(2026, 7, 1, 12, 0, tzinfo=ZoneInfo("Europe/Prague"))
+        """A Berlin time comes back as the same instant with the same offset."""
+        summer = datetime(2026, 7, 1, 12, 0, tzinfo=ZoneInfo("Europe/Berlin"))
         run_id = self.new_run(queued_at=summer, scheduled_for=summer)
         record = self.store.get_run(run_id)
         self.assertEqual(record.queued_at, summer)
@@ -273,7 +273,7 @@ class RecoveryAndRetryTests(StoreTestCase):
 
     def test_due_retries_compares_instants_across_offsets(self) -> None:
         """A retry time in another zone is compared as an instant, not as text."""
-        # 06:30 UTC is 07:30 in Prague (winter): exactly due, as retry_at <= now.
+        # 06:30 UTC is 07:30 in Berlin (winter): exactly due, as retry_at <= now.
         run_id = self.new_run()
         self.finish(
             run_id,

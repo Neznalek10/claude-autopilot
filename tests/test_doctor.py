@@ -82,7 +82,7 @@ class DoctorTestCase(unittest.TestCase):
 
     def make_settings(self, **env: str) -> Settings:
         """Build Settings in the temp home, with the fake Claude unless overridden."""
-        values = {"CLAUDE_BIN": str(FAKE_CLAUDE), "AUTOPILOT_TIMEZONE": "Europe/Prague"}
+        values = {"CLAUDE_BIN": str(FAKE_CLAUDE), "AUTOPILOT_TIMEZONE": "Europe/Berlin"}
         values.update(env)
         return load_settings(env=values, home=self.home, read_env_file=False)
 

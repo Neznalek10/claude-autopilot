@@ -72,7 +72,7 @@ class CliTestCase(unittest.TestCase):
             "AUTOPILOT_HOME": str(self.home),
             "AUTOPILOT_TASKS_FILE": "",
             "AUTOPILOT_DATA_DIR": "",
-            "AUTOPILOT_TIMEZONE": "Europe/Prague",
+            "AUTOPILOT_TIMEZONE": "Europe/Berlin",
             "AUTOPILOT_LOG_LEVEL": "",
             "AUTOPILOT_MAX_PARALLEL": "",
             "CLAUDE_BIN": str(FAKE_CLAUDE),
@@ -486,9 +486,9 @@ class RunAndAskTests(CliTestCase):
     def test_ask_prints_answer(self) -> None:
         """A one-off prompt is answered on stdout and stored as an ask run."""
         self.write_tasks()
-        code, out, _ = self.run_cli("ask", "Příliš žluťoučký kůň")
+        code, out, _ = self.run_cli("ask", "Naïve café résumé ☕")
         self.assertEqual(code, 0)
-        self.assertIn("echo: Příliš žluťoučký kůň", out)
+        self.assertIn("echo: Naïve café résumé ☕", out)
         self.assertEqual(self.store().list_runs(task_name="ask")[0].trigger, "manual")
 
     def test_ask_empty_prompt_is_friendly_error(self) -> None:

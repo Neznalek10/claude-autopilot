@@ -64,7 +64,7 @@ class AppTestCase(unittest.TestCase):
 
     def make_settings(self, **env: str) -> Settings:
         """Build Settings in the temp home using the fake Claude binary."""
-        values = {"CLAUDE_BIN": str(FAKE_CLAUDE), "AUTOPILOT_TIMEZONE": "Europe/Prague"}
+        values = {"CLAUDE_BIN": str(FAKE_CLAUDE), "AUTOPILOT_TIMEZONE": "Europe/Berlin"}
         values.update(env)
         return load_settings(env=values, home=self.home, read_env_file=False)
 

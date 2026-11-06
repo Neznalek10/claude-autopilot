@@ -444,8 +444,8 @@ class ChatTests(BotTestCase):
 
     def test_plain_text_enqueues_chat_and_shows_typing(self) -> None:
         """Text with nothing ahead starts a chat run and the typing indicator."""
-        self.send("Příliš žluťoučký kůň")
-        self.assertEqual(self.engine.calls, [("enqueue_prompt", ("Příliš žluťoučký kůň", TRIGGER_CHAT))])
+        self.send("Naïve café résumé ☕")
+        self.assertEqual(self.engine.calls, [("enqueue_prompt", ("Naïve café résumé ☕", TRIGGER_CHAT))])
         self.assertEqual(self.client.chat_actions, [(CHAT_ID, "typing")])
         self.assertEqual(self.client.sent, [])
 

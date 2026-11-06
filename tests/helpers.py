@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from autopilot.schedule import Schedule
 
 # The time zone used by every fixed test moment. A zone with DST, so DST logic gets exercised.
-TZ = ZoneInfo("Europe/Prague")
+TZ = ZoneInfo("Europe/Berlin")
 
 # Executable stand-in for the Claude CLI; its behaviour is documented in fake_claude.py.
 FAKE_CLAUDE = Path(__file__).with_name("fake_claude.py")

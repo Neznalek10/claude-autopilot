@@ -42,7 +42,7 @@ from autopilot.runner import (
 from helpers import FAKE_CLAUDE, TZ, FakeClock, make_options
 
 NOW = datetime(2026, 11, 2, 15, 0, tzinfo=TZ)
-CZECH_SENTENCE = "Příliš žluťoučký kůň"
+UNICODE_SENTENCE = "Naïve café résumé ☕"
 POLL_SECONDS = 3.0
 POLL_INTERVAL = 0.05
 
@@ -358,8 +358,8 @@ class DetectRateLimitTests(unittest.TestCase):
                 self.assertTrue(detect_rate_limit(phrase, NOW)[0])
 
     def test_ordinary_text_is_not_a_limit(self) -> None:
-        """Unrelated text, including empty text and Czech, is not a limit."""
-        for text in ("", "All good", CZECH_SENTENCE, "unlimited usage"):
+        """Unrelated text, including empty text and accented text, is not a limit."""
+        for text in ("", "All good", UNICODE_SENTENCE, "unlimited usage"):
             with self.subTest(text=text):
                 self.assertEqual(detect_rate_limit(text, NOW), (False, None))
 
@@ -427,17 +427,17 @@ class DetectRateLimitTests(unittest.TestCase):
 
     def test_real_weekly_wording_with_zone_name(self) -> None:
         """The wording seen in practice, with a trailing zone name, still reads 22:20."""
-        text = "You've hit your session limit · resets 10:20pm (Europe/Prague)"
+        text = "You've hit your session limit · resets 10:20pm (Europe/Berlin)"
         self.assertEqual(
             detect_rate_limit(text, NOW)[1], datetime(2026, 11, 2, 22, 22, tzinfo=TZ)
         )
 
     def test_zone_named_in_the_message_wins_over_autopilot_zone(self) -> None:
-        """'resets 10:20pm (Europe/Prague)' means Prague time even when autopilot runs elsewhere."""
+        """'resets 10:20pm (Europe/Berlin)' means Berlin time even when autopilot runs elsewhere."""
         new_york_noon = datetime(2026, 11, 3, 12, 0, tzinfo=ZoneInfo("America/New_York"))
-        text = "You've hit your session limit · resets 10:20pm (Europe/Prague)"
+        text = "You've hit your session limit · resets 10:20pm (Europe/Berlin)"
         reset = detect_rate_limit(text, new_york_noon)[1]
-        self.assertEqual(reset, datetime(2026, 11, 3, 22, 22, tzinfo=ZoneInfo("Europe/Prague")))
+        self.assertEqual(reset, datetime(2026, 11, 3, 22, 22, tzinfo=ZoneInfo("Europe/Berlin")))
 
     def test_utc_and_gmt_count_as_zones(self) -> None:
         """'(UTC)' and '(GMT)' after the time are read as those zones, not autopilot's zone."""
@@ -503,7 +503,7 @@ class DetectRateLimitTests(unittest.TestCase):
                 self.assertEqual(detect_rate_limit(text, NOW), (True, None))
 
     def test_clock_time_across_spring_forward(self) -> None:
-        """Wall-clock times follow the local zone's DST change (Prague, 29 March 2026)."""
+        """Wall-clock times follow the local zone's DST change (Berlin, 29 March 2026)."""
         before_change = datetime(2026, 3, 28, 23, 0, tzinfo=TZ)
         _, retry_at = detect_rate_limit("usage limit resets 5pm", before_change)
         self.assertEqual(retry_at.astimezone(TZ).hour, 17)
@@ -554,8 +554,8 @@ class ParseOutputTests(unittest.TestCase):
         self.assertEqual(self.parse(json.dumps(payload)).duration_ms, 77)
 
     def test_unicode_result_is_preserved(self) -> None:
-        """Czech text survives parsing."""
-        self.assertEqual(self.parse(result_json(result=CZECH_SENTENCE)).result, CZECH_SENTENCE)
+        """Accented text survives parsing."""
+        self.assertEqual(self.parse(result_json(result=UNICODE_SENTENCE)).result, UNICODE_SENTENCE)
 
     def test_json_on_last_line_after_noise(self) -> None:
         """A warning line before the JSON object doesn't stop it from being read."""
@@ -737,15 +737,15 @@ class ClaudeRunnerTests(unittest.TestCase):
 
     def test_success_sends_prompt_on_stdin(self) -> None:
         """The prompt reaches Claude on stdin, not in argv, and the answer comes back."""
-        outcome = self.runner.run(f"-hello {CZECH_SENTENCE}", self.options())
+        outcome = self.runner.run(f"-hello {UNICODE_SENTENCE}", self.options())
         self.assertEqual(outcome.status, STATUS_SUCCESS)
-        self.assertEqual(outcome.result, f"echo: -hello {CZECH_SENTENCE}")
+        self.assertEqual(outcome.result, f"echo: -hello {UNICODE_SENTENCE}")
         self.assertEqual(outcome.num_turns, 1)
         self.assertEqual(outcome.cost_usd, 0.001)
         self.assertTrue(outcome.session_id.startswith("fake-session-"))
         call = self.logged_calls()[0]
-        self.assertEqual(call["prompt"], f"-hello {CZECH_SENTENCE}")
-        self.assertNotIn(f"-hello {CZECH_SENTENCE}", call["argv"])
+        self.assertEqual(call["prompt"], f"-hello {UNICODE_SENTENCE}")
+        self.assertNotIn(f"-hello {UNICODE_SENTENCE}", call["argv"])
         self.assertEqual(call["argv"][0], "-p")
         self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(self.workdir))
 

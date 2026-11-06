@@ -130,9 +130,9 @@ class DefaultsAndMergeTest(TaskConfigTestCase):
 
     def test_task_order_and_unicode_prompt(self) -> None:
         """Tasks keep file order and unicode prompts survive."""
-        config = self.parse({"task": [self.task(name="b", prompt="Příliš žluťoučký kůň"), self.task(name="a")]})
+        config = self.parse({"task": [self.task(name="b", prompt="Naïve café résumé ☕"), self.task(name="a")]})
         self.assertEqual(list(config.tasks), ["b", "a"])
-        self.assertEqual(config.tasks["b"].prompt, "Příliš žluťoučký kůň")
+        self.assertEqual(config.tasks["b"].prompt, "Naïve café résumé ☕")
 
 
 class SandboxTest(TaskConfigTestCase):

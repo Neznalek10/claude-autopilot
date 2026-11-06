@@ -194,7 +194,7 @@ class IntegrationCase(unittest.TestCase):
         """
         env = {
             "CLAUDE_BIN": str(claude),
-            "AUTOPILOT_TIMEZONE": "Europe/Prague",
+            "AUTOPILOT_TIMEZONE": "Europe/Berlin",
             "AUTOPILOT_MAX_PARALLEL": str(max_parallel),
         }
         if telegram:
@@ -435,7 +435,7 @@ class AC2ScheduleTests(unittest.TestCase):
         self.assertEqual(days, [(11, 9, 7), (11, 10, 7), (11, 11, 7), (11, 12, 7), (11, 13, 7)])
 
     def test_spring_forward_gap_is_skipped(self) -> None:
-        """02:30 does not exist on 2026-03-29 in Prague, so that day has no fire."""
+        """02:30 does not exist on 2026-03-29 in Berlin, so that day has no fire."""
         schedule = parse_schedule("daily 02:30")
         self.assertEqual(
             schedule.next_after(datetime(2026, 3, 28, 12, 0, tzinfo=TZ)),
@@ -976,7 +976,7 @@ class AC10CliTests(IntegrationCase):
         env = {
             **self.child_env,
             "AUTOPILOT_HOME": str(self.home),
-            "AUTOPILOT_TIMEZONE": "Europe/Prague",
+            "AUTOPILOT_TIMEZONE": "Europe/Berlin",
             "CLAUDE_BIN": str(FAKE_CLAUDE),
             "PYTHONPATH": str(PROJECT_ROOT),
         }
@@ -1199,8 +1199,8 @@ class AC15ChatTests(IntegrationCase):
     def test_second_turn_resumes_the_first_session_and_new_drops_it(self) -> None:
         """Turn two passes --resume <first session>; /new starts a conversation without --resume."""
         app = self.build(workers=True)
-        self.chat(app, "Příliš žluťoučký kůň", 1)
-        self.assertEqual(self.texts()[0], "echo: Příliš žluťoučký kůň")  # chat answers have no header
+        self.chat(app, "Naïve café résumé ☕", 1)
+        self.assertEqual(self.texts()[0], "echo: Naïve café résumé ☕")  # chat answers have no header
         self.assertEqual(self.client.chat_actions, [(CHAT_ID, "typing")])
         first_session = app.store.get_value(CHAT_SESSION_KEY)
         self.assertTrue((first_session or "").startswith("fake-session-"))

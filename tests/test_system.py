@@ -46,7 +46,7 @@ class RunCommandTest(unittest.TestCase):
 
     def test_unicode_output_round_trips_unchanged(self) -> None:
         """Non-ASCII output is decoded as UTF-8 regardless of the locale."""
-        text = "Příliš žluťoučký kůň"
+        text = "Naïve café résumé ☕"
         script = f"import sys; sys.stdout.buffer.write({text.encode('utf-8')!r})"
         _, stdout, _ = run_command([sys.executable, "-c", script])
         self.assertEqual(stdout, text)
