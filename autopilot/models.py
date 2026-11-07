@@ -94,6 +94,7 @@ BOT_COMMANDS = (
     ("status", "What is running and queued"),
     ("pause", "Pause a task's schedule"),
     ("resume", "Resume a task's schedule"),
+    ("spend", "Log money: /spend 120 Cafe, snack (+ for income)"),
     ("help", "How to use this bot"),
 )
 

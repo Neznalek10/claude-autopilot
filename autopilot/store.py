@@ -385,6 +385,36 @@ class Store:
             ).fetchall()
         return [_row_to_record(row) for row in rows]
 
+    def runs_of_session(self, session_id: str) -> list[RunRecord]:
+        """All runs of one Claude session, newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {RUN_COLUMNS} FROM runs WHERE session_id = ? ORDER BY id DESC", (session_id,)
+            ).fetchall()
+        return [_row_to_record(row) for row in rows]
+
+    def search_runs(self, text: str, *, limit: int = 50) -> list[RunRecord]:
+        """Find runs whose prompt or result contains ``text`` (case-insensitive), newest first.
+
+        Args:
+            text: Text to look for; ``%`` and ``_`` are matched literally.
+            limit: Maximum number of runs to return.
+
+        Returns:
+            Matching records, newest first.
+        """
+        if "\x00" in text:
+            return []
+        escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {RUN_COLUMNS} FROM runs "
+                "WHERE prompt LIKE ? ESCAPE '\\' OR result LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
+                (pattern, pattern, limit),
+            ).fetchall()
+        return [_row_to_record(row) for row in rows]
+
     def active_runs(self) -> list[RunRecord]:
         """List queued and running runs.
 

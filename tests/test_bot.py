@@ -439,6 +439,64 @@ class CommandTests(BotTestCase):
         self.assertEqual(self.texts(), ["Unknown command. Send /help."])
 
 
+class SpendCommandTests(BotTestCase):
+    """The /spend command writes to the configured balance file."""
+
+    BALANCE = "# Balance\n\nCurrent balance: **100 EUR**\n\n## November 2026\n\n|    Date    | Amount (EUR) | Where | Circumstances \n|------------|------|---------------|------------\n"
+
+    def setUp(self) -> None:
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.balance = Path(tmp.name) / "balance.md"
+        self.balance.write_text(self.BALANCE, encoding="utf-8")
+        self.bot.balance_file = self.balance
+
+    def test_logs_entry_and_confirms_the_new_balance(self) -> None:
+        """A valid entry lands in the file under today's month and the reply shows the balance."""
+        self.send("/spend 35 Cafe, snack")
+        self.assertIn("Logged -35 EUR, Cafe (snack).\nBalance: 65 EUR", self.texts()[-1])
+        text = self.balance.read_text(encoding="utf-8")
+        self.assertIn("| 2026-11-02 | -35 | Cafe | snack", text)
+        self.assertIn("Current balance: **65 EUR**", text)
+
+    def test_income_with_plus(self) -> None:
+        """A leading plus adds money."""
+        self.send("/spend +200 allowance")
+        self.assertIn("Balance: 300 EUR", self.texts()[-1])
+
+    def test_reply_escapes_html(self) -> None:
+        """User text cannot inject markup into the Telegram reply."""
+        self.send("/spend 5 <b>x</b>")
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;", self.texts()[-1])
+
+    def test_bad_input_gets_help_and_leaves_the_file_alone(self) -> None:
+        """Missing amount, missing place and an empty command all explain the format."""
+        for text in ("/spend", "/spend Cafe", "/spend 50"):
+            with self.subTest(text=text):
+                self.send(text)
+                self.assertIn("/spend", self.texts()[-1])
+        self.assertEqual(self.balance.read_text(encoding="utf-8"), self.BALANCE)
+
+    def test_missing_balance_file_is_reported(self) -> None:
+        """A balance file that disappeared gives a clear error, not a crash."""
+        self.balance.unlink()
+        self.send("/spend 5 Cafe")
+        self.assertIn("Cannot read the balance file", self.texts()[-1])
+
+    def test_off_without_a_balance_file(self) -> None:
+        """Without AUTOPILOT_BALANCE_FILE the command explains how to enable it."""
+        self.bot.balance_file = None
+        self.send("/spend 5 Cafe")
+        self.assertIn("AUTOPILOT_BALANCE_FILE", self.texts()[-1])
+
+    def test_other_chats_cannot_log_money(self) -> None:
+        """Only the owner's private chat reaches the handler."""
+        self.bot.handle_update(message_update("/spend 5 Cafe", chat_id=CHAT_ID + 1, sender_id=CHAT_ID + 1))
+        self.assertEqual(self.balance.read_text(encoding="utf-8"), self.BALANCE)
+        self.assertEqual(self.texts(), [])
+
+
 class ChatTests(BotTestCase):
     """Plain text, /ask and /new."""
 

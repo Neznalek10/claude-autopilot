@@ -26,6 +26,7 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, tzinfo
+from pathlib import Path
 from typing import Any, Protocol
 
 from autopilot.errors import TaskNotFoundError, TelegramError
@@ -48,6 +49,7 @@ from autopilot.models import (
     RunRecord,
     TaskConfig,
 )
+from autopilot.spending import USAGE, SpendingError, add_entry, format_amount, parse_entry
 from autopilot.store import Store
 from autopilot.telegram_api import TelegramClient, is_parse_error
 
@@ -68,6 +70,7 @@ TYPING_ACTION = "typing"
 
 REPLY_NEW_CONVERSATION = "🆕 New conversation. What's on your mind?"
 REPLY_UNKNOWN_COMMAND = "Unknown command. Send /help."
+REPLY_SPEND_DISABLED = "Money logging is off. Set AUTOPILOT_BALANCE_FILE in .env to your balance file, then restart the service."
 REPLY_NO_FINISHED_RUNS = "No finished runs yet."
 REPLY_ASK_USAGE = "Usage: /ask &lt;text&gt; (or just type your message)."
 
@@ -283,6 +286,7 @@ class TelegramBot:
         *,
         chat_id: int,
         clock: Callable[[], datetime],
+        balance_file: Path | None = None,
     ) -> None:
         """Wire the bot to its collaborators.
 
@@ -293,6 +297,7 @@ class TelegramBot:
             notifier: Sends all replies to ``chat_id``.
             chat_id: The only chat the bot answers.
             clock: Returns the aware current time.
+            balance_file: Balance file for /spend; None turns money logging off.
         """
         self.client = client
         self.engine = engine
@@ -300,6 +305,7 @@ class TelegramBot:
         self.notifier = notifier
         self.chat_id = chat_id
         self.clock = clock
+        self.balance_file = balance_file
         self._offset: int | None = None
         self._handlers: dict[str, Callable[[str], None]] = {
             "start": self._cmd_help,
@@ -312,6 +318,7 @@ class TelegramBot:
             "status": self._cmd_status,
             "pause": self._cmd_pause,
             "resume": self._cmd_resume,
+            "spend": self._cmd_spend,
         }
 
     # --- Update handling ---------------------------------------------------------------
@@ -495,6 +502,24 @@ class TelegramBot:
     def _cmd_help(self, argument: str) -> None:
         """/help and /start: show the usage text."""
         self._reply(help_text())
+
+    def _cmd_spend(self, argument: str) -> None:
+        """/spend: add one entry to the balance file and confirm the new balance."""
+        if self.balance_file is None:
+            self._reply(REPLY_SPEND_DISABLED)
+            return
+        try:
+            entry = parse_entry(argument)
+            balance = add_entry(self.balance_file, entry, self.clock().date())
+        except SpendingError as error:
+            text = str(error) if argument else USAGE
+            self._reply(escape_html(text))
+            return
+        note = f" ({entry.note})" if entry.note else ""
+        self._reply(
+            f"Logged {format_amount(entry.amount, signed=True)} {balance.currency}, "
+            f"{escape_html(entry.where)}{escape_html(note)}.\nBalance: {format_amount(balance.amount)} {balance.currency}"
+        )
 
     def _cmd_tasks(self, argument: str) -> None:
         """/tasks: list tasks with next and last runs."""
