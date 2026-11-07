@@ -82,6 +82,12 @@ class LoadSettingsTest(unittest.TestCase):
         self.assertEqual(settings.telegram_chat_id, 123456789)
         self.assertTrue(settings.telegram_enabled)
 
+    def test_balance_file_is_optional_and_resolved_against_home(self) -> None:
+        """AUTOPILOT_BALANCE_FILE is off by default; a relative path starts at the home folder."""
+        self.assertIsNone(self.load({"AUTOPILOT_TIMEZONE": "UTC"}).balance_file)
+        settings = self.load({"AUTOPILOT_TIMEZONE": "UTC", "AUTOPILOT_BALANCE_FILE": "money/balance.md"})
+        self.assertEqual(settings.balance_file, self.home.resolve() / "money" / "balance.md")
+
     def test_token_without_chat_is_not_enabled(self) -> None:
         """Telegram needs both values."""
         self.assertFalse(self.load({"AUTOPILOT_TIMEZONE": "UTC", "TELEGRAM_BOT_TOKEN": "tok"}).telegram_enabled)

@@ -142,6 +142,11 @@ Settings come from `.env` in the project folder and from the real environment. A
 | `AUTOPILOT_HOME` | the project folder | Project home folder. Read from the real environment only, not from `.env`. |
 | `AUTOPILOT_TASKS_FILE` | `tasks.toml` in the home folder | Path to the task file. |
 | `AUTOPILOT_DATA_DIR` | `data/` in the home folder | Folder for `autopilot.db` and `autopilot.log`. |
+| `AUTOPILOT_BALANCE_FILE` | none (money logging off) | Markdown file the `/spend` command writes to. It needs a `Current balance: **<number> <CUR>**` (any 3-letter currency code) line and one `## <Month> <Year>` table per month, newest entry first. |
+| `AUTOPILOT_WEB_TOKEN` | none (viewer off) | Login token for the web viewer, at least 20 characters. See [Web viewer](#web-viewer). |
+| `AUTOPILOT_WEB_HOST` | `127.0.0.1` | Address the viewer listens on. |
+| `AUTOPILOT_WEB_PORT` | `8765` | Port the viewer listens on. |
+| `AUTOPILOT_CLAUDE_PROJECTS_DIR` | none | Folder with Claude Code transcripts, usually `~/.claude/projects`, shown in the viewer's VS Code tab. |
 | `AUTOPILOT_TIMEZONE` | the system time zone | IANA time zone for schedules, for example `Europe/Berlin`. |
 | `AUTOPILOT_MAX_PARALLEL` | `1` | Runs that may execute at the same time, from 1 to 4. Keep it at 1 if you chat with the bot: with more workers, quick chat messages can be answered out of order. |
 | `AUTOPILOT_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
@@ -166,7 +171,20 @@ Send a command to your bot, or type a message without a command:
 | `/status` | Shows what is running, what is queued, and the next three runs. |
 | `/pause <task>` | Stops a task's schedule. Manual runs still work. |
 | `/resume <task>` | Starts a paused task's schedule again. |
+| `/spend <amount> <where>[, <note>]` | Adds a money entry to your balance file and replies with the new balance. A leading `+` is income, for example `/spend +200 allowance`. Needs `AUTOPILOT_BALANCE_FILE`. |
 | `/help` or `/start` | Shows the help text. |
+
+## Web viewer
+
+A read-only page for browsing your chats and results, built for phone screens. Tabs: **Chats** (each conversation as a thread), **Runs** (every task run, failures marked), **VS Code** (your Claude Code chats, when `AUTOPILOT_CLAUDE_PROJECTS_DIR` is set) and a search box over all of them.
+
+1. Make a token: `python3 -c "import secrets; print(secrets.token_urlsafe(24))"` and put it in `.env` as `AUTOPILOT_WEB_TOKEN`.
+2. Restart the service: `systemctl --user restart autopilot`.
+3. Open `http://localhost:8765/?token=<your token>` on the computer. The browser remembers the login for 30 days.
+
+For your phone, put the computer and the phone on a private network such as [Tailscale](https://tailscale.com), set `AUTOPILOT_WEB_HOST` to the computer's private address, and open `http://<that address>:8765/?token=<your token>`. Do not open the port to the internet: the pages show your results and chats.
+
+Safety: the viewer only answers GET requests, so it cannot run or change anything. Without the token it shows only a sign-in page. Text that looks like a token, key or password is hidden. Tool output and Claude's thinking are not shown for VS Code chats.
 
 Chat works like a conversation. Each message continues the last chat session, so Claude remembers what you said before. The conversation starts fresh in two cases: when you send `/new`, and when six hours pass without a message. If a chat turn fails, the conversation is reset too, and the error message says so.
 

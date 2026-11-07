@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-11-07
+
+### Added
+
+- Read-only web viewer with a phone-first layout: chats as threads, task runs, search, and an optional tab for Claude Code transcripts. Off unless `AUTOPILOT_WEB_TOKEN` is set. Settings: `AUTOPILOT_WEB_TOKEN`, `AUTOPILOT_WEB_HOST`, `AUTOPILOT_WEB_PORT`, `AUTOPILOT_CLAUDE_PROJECTS_DIR`.
+
+## [1.1.0] - 2026-11-07
+
+### Added
+
+- `/spend <amount> <where>[, <note>]` Telegram command that adds an entry to a Markdown balance file and replies with the new balance. A leading `+` marks income. Set the file with `AUTOPILOT_BALANCE_FILE`; without it the command is off.
+
 ## [1.0.0] - 2026-11-03
 
 First release.

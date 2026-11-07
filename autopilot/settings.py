@@ -40,6 +40,10 @@ LOG_FILE_NAME = "autopilot.log"
 
 MIN_PARALLEL = 1
 MAX_PARALLEL_LIMIT = 4
+MIN_WEB_TOKEN_LENGTH = 20
+WEB_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
+DEFAULT_WEB_HOST = "127.0.0.1"
+DEFAULT_WEB_PORT = 8765
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 DEFAULT_LOG_LEVEL = "INFO"
 
@@ -71,6 +75,11 @@ class Settings:
         claude_bin: Configured Claude CLI path (``CLAUDE_BIN``), if any.
         telegram_token: Bot token, if configured. Never log it.
         telegram_chat_id: The one chat the bot answers, if configured.
+        balance_file: Markdown balance file the /spend command writes to, if configured.
+        web_token: Login token of the web viewer; the viewer is off without it. Never log it.
+        web_host: Address the viewer listens on (default loopback only).
+        web_port: Port the viewer listens on.
+        claude_projects_dir: Folder with Claude Code transcripts to browse, if configured.
         max_parallel: Number of runs executed at once (1-4).
         log_level: One of DEBUG, INFO, WARNING, ERROR.
     """
@@ -85,6 +94,11 @@ class Settings:
     claude_bin: str | None
     telegram_token: str | None
     telegram_chat_id: int | None
+    balance_file: Path | None
+    web_token: str | None
+    web_host: str
+    web_port: int
+    claude_projects_dir: Path | None
     max_parallel: int
     log_level: str
 
@@ -122,6 +136,33 @@ def _resolve_path(raw: str, home: Path, variable: str) -> Path:
     if not path.is_absolute():
         path = home / path
     return path.resolve()
+
+
+def _parse_web_token(raw: str | None) -> str | None:
+    """Parse AUTOPILOT_WEB_TOKEN: unset turns the viewer off; otherwise it must be long enough to resist guessing."""
+    if raw is None:
+        return None
+    if len(raw) < MIN_WEB_TOKEN_LENGTH:
+        raise ConfigError(
+            f"AUTOPILOT_WEB_TOKEN must have at least {MIN_WEB_TOKEN_LENGTH} characters. "
+            "Create one with: python3 -c \"import secrets; print(secrets.token_urlsafe(24))\""
+        )
+    if not WEB_TOKEN_RE.match(raw):
+        raise ConfigError("AUTOPILOT_WEB_TOKEN may only contain letters, digits, '-', '_', '.' and '~'.")
+    return raw
+
+
+def _parse_web_port(raw: str | None) -> int:
+    """Parse AUTOPILOT_WEB_PORT (1-65535, default 8765)."""
+    if raw is None:
+        return DEFAULT_WEB_PORT
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = 0
+    if not 1 <= value <= 65535:
+        raise ConfigError(f"AUTOPILOT_WEB_PORT must be a whole number from 1 to 65535, got '{raw}'.")
+    return value
 
 
 def _parse_max_parallel(raw: str | None) -> int:
@@ -220,6 +261,10 @@ def load_settings(
         for key, value in _non_empty(dotenv_values(env_file)).items():
             merged.setdefault(key, value)
 
+    balance_raw = merged.get("AUTOPILOT_BALANCE_FILE")
+    balance_file = _resolve_path(balance_raw, home, "AUTOPILOT_BALANCE_FILE") if balance_raw else None
+    projects_raw = merged.get("AUTOPILOT_CLAUDE_PROJECTS_DIR")
+    claude_projects_dir = _resolve_path(projects_raw, home, "AUTOPILOT_CLAUDE_PROJECTS_DIR") if projects_raw else None
     tasks_file = _resolve_path(merged.get("AUTOPILOT_TASKS_FILE", DEFAULT_TASKS_FILE_NAME), home, "AUTOPILOT_TASKS_FILE")
     data_dir = _resolve_path(merged.get("AUTOPILOT_DATA_DIR", DEFAULT_DATA_DIR_NAME), home, "AUTOPILOT_DATA_DIR")
     return Settings(
@@ -233,6 +278,11 @@ def load_settings(
         claude_bin=merged.get("CLAUDE_BIN"),
         telegram_token=merged.get("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_parse_chat_id(merged.get("TELEGRAM_CHAT_ID")),
+        balance_file=balance_file,
+        web_token=_parse_web_token(merged.get("AUTOPILOT_WEB_TOKEN")),
+        web_host=merged.get("AUTOPILOT_WEB_HOST", DEFAULT_WEB_HOST),
+        web_port=_parse_web_port(merged.get("AUTOPILOT_WEB_PORT")),
+        claude_projects_dir=claude_projects_dir,
         max_parallel=_parse_max_parallel(merged.get("AUTOPILOT_MAX_PARALLEL")),
         log_level=_parse_log_level(merged.get("AUTOPILOT_LOG_LEVEL")),
     )

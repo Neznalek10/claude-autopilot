@@ -52,6 +52,7 @@ from autopilot.settings import (
 from autopilot.store import Store
 from autopilot.tasks import load_task_config
 from autopilot.telegram_api import TelegramClient
+from autopilot.web import start_web
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +282,8 @@ def build_app(
 
     bot: TelegramBot | None = None
     if telegram_client is not None and telegram_notifier is not None and chat_id is not None:
-        bot = TelegramBot(telegram_client, engine, store, telegram_notifier, chat_id=chat_id, clock=now)
+        bot = TelegramBot(telegram_client, engine, store, telegram_notifier, chat_id=chat_id, clock=now,
+                          balance_file=settings.balance_file)
     return App(settings, store, engine, notifier, telegram_client, bot)
 
 
@@ -346,7 +348,13 @@ def _serve(app: App, stop: threading.Event) -> None:
             threading.Thread(
                 target=app.bot.poll_forever, args=(stop,), name="telegram-bot", daemon=True
             ).start()
-        app.engine.run_forever(stop)
+        web = start_web(app.settings, app.store)
+        try:
+            app.engine.run_forever(stop)
+        finally:
+            if web is not None:
+                web.shutdown()
+                web.server_close()
     finally:
         # Put the original handlers back so embedding code is unaffected.
         for signum, handler in previous.items():
