@@ -79,7 +79,7 @@ Keys for `[[task]]` (and for `[defaults]`, where they are shared):
 | `workdir` | Folder Claude runs in. `~` and relative paths work. | `workspace/` next to `tasks.toml`, a private empty folder created for you |
 | `model` | Model alias or id, for example `sonnet` or `haiku`. | Claude's default |
 | `effort` | `low`, `medium`, `high`, `xhigh` or `max`. | Claude's default |
-| `allowed_tools` | Tools Claude may use without asking, for example `["Read", "Bash(git log *)"]`. | `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch` |
+| `allowed_tools` | Tools Claude may use without asking, for example `["Read", "Bash(git log *)"]`. | `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch`. Chat (`[ask]`) also gets scoped edit and write and safe shell commands, see Security model. |
 | `disallowed_tools` | Tools Claude may never use. | none |
 | `permission_mode` | `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk` or `plan`. With `dontAsk`, anything not in `allowed_tools` is blocked. | `dontAsk` |
 | `add_dirs` | Extra folders Claude may access. | none |
@@ -285,7 +285,7 @@ Scheduled runs share the plan's limits with your normal Claude use. A busy day o
 - The bot answers only your private chat, the one `telegram-setup` saved. Messages from other chats, including groups, get no reply and are logged with their chat id. `telegram-setup` only accepts a code sent from a private chat and asks you to confirm it.
 - Tasks run in a private `workspace/` folder by default, which starts empty. Point `workdir` somewhere else only when a task needs your files.
 - Claude is always blocked from reading credential and secret files, whatever `allowed_tools` says. That covers `.env` files, SSH and cloud keys (`~/.ssh`, `~/.aws`, `~/.gnupg`), `~/.config/gws`, `~/.config/gh`, `~/.config/gcloud` and `~/.kube`, the Git, Docker and npm token files (`~/.git-credentials`, `~/.netrc`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`), Claude's own credentials and config files, and the autopilot `data/` folder (database and log).
-- Chat (`[ask]`) in the shipped example can edit files and run any shell command, so a message you send can change your machine. Only your private chat reaches it. For read-only chat, remove `Edit`, `Write` and `Bash` from `[ask]` `allowed_tools`.
+- Chat (`[ask]`) can by default edit and write files inside the workspace folder and run a short list of safe shell commands (`ls`, `pwd`, `date`, `wc`, `mkdir`, `git status/log/diff/show/branch`). Deleting, moving, installing and network commands are blocked, and so are writes outside the folder. To change this, set `allowed_tools` under `[ask]`.
 - Tools are allow-listed per task. Anything outside `allowed_tools` is denied under the default `dontAsk` mode. Denied tools are listed in the result as blocked, with a hint.
 - Every run removes `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from its environment, so the subscription login is used. `TELEGRAM_*` variables and other `CLAUDE_*` variables are removed too, so the bot token never reaches Claude.
 - The bot token is redacted from every log line. `.env` is written with mode 600. The `data/` folder is created owner-only (mode 700), and the database and log files are owner-only too.

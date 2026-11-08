@@ -62,11 +62,10 @@
 notify = "always"
 
 [ask]
-# Chat messages from Telegram. Chat can read, edit and write files and run shell commands
-# (in the workspace folder by default), plus research the web. Credential files stay blocked.
-# Only your own private chat can reach this. To make chat read-only, use
-# allowed_tools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch"].
-allowed_tools = ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebSearch", "WebFetch"]
+# Chat messages from Telegram. With no allowed_tools here, chat can research the web, read
+# files, edit and write files inside the workspace folder, and run a short list of safe shell
+# commands (ls, pwd, date, wc, mkdir, git status/log/diff/show/branch). Credential files stay
+# blocked. Set allowed_tools to change this, for example to make chat read-only.
 timeout_minutes = 15
 
 [[task]]

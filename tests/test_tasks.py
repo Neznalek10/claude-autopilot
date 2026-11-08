@@ -17,6 +17,7 @@ from autopilot.errors import ConfigError, ScheduleError
 from autopilot.models import DEFAULT_PERMISSION_MODE, NOTIFY_ALWAYS
 from autopilot.tasks import (
     DEFAULT_ALLOWED_TOOLS,
+    DEFAULT_ASK_ALLOWED_TOOLS,
     PROTECTED_READ_RULES,
     load_task_config,
     parse_task_config,
@@ -60,6 +61,23 @@ class DefaultsAndMergeTest(TaskConfigTestCase):
         self.assertEqual(config.tasks, {})
         self.assertEqual(config.ask_options.timeout_seconds, 15 * 60)
         self.assertEqual(config.ask_options.workdir, self.base / "workspace")
+
+    def test_ask_default_allows_scoped_edit_and_restricted_bash(self) -> None:
+        """Chat edits files in its folder and runs only listed shell commands by default."""
+        tools = self.parse({}).ask_options.allowed_tools
+        self.assertEqual(tools, DEFAULT_ASK_ALLOWED_TOOLS)
+        self.assertIn("Edit(./**)", tools)
+        self.assertIn("Write(./**)", tools)
+        self.assertNotIn("Bash", tools)
+        self.assertNotIn("Edit", tools)
+        self.assertTrue(all(t == "Bash(pwd)" or not t.startswith("Bash(") or t.endswith(" *)") for t in tools))
+        self.assertFalse(any(t.startswith(("Bash(rm", "Bash(curl", "Bash(python")) for t in tools))
+
+    def test_ask_default_does_not_change_task_default(self) -> None:
+        """Tasks keep the read-only default; an [ask] allowed_tools list still wins."""
+        config = self.parse({"ask": {"allowed_tools": ["Read"]}, "task": [self.task(prompt="x")]})
+        self.assertEqual(config.ask_options.allowed_tools, ("Read",))
+        self.assertEqual(config.tasks["news"].options.allowed_tools, DEFAULT_ALLOWED_TOOLS)
 
     def test_minimal_task_gets_builtin_defaults(self) -> None:
         """A task with name and prompt only gets every default."""

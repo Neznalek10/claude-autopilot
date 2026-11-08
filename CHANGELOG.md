@@ -8,7 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
-- The example `[ask]` section now allows `Edit`, `Write` and `Bash`, so chat can edit files and run commands. Credential files stay blocked. Remove those three tools for read-only chat.
+- Chat now defaults to editing and writing files inside its workspace folder and a short list of safe shell commands (`ls`, `pwd`, `date`, `wc`, `mkdir`, `git status/log/diff/show/branch`). Set `allowed_tools` under `[ask]` to change it. Credential files stay blocked.
 
 ## [1.2.0] - 2026-11-07
 
