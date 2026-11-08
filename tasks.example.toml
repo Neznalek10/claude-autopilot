@@ -62,8 +62,11 @@
 notify = "always"
 
 [ask]
-# Chat messages from Telegram. Read-only research tools, shorter timeout.
-allowed_tools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+# Chat messages from Telegram. Chat can read, edit and write files and run shell commands
+# (in the workspace folder by default), plus research the web. Credential files stay blocked.
+# Only your own private chat can reach this. To make chat read-only, use
+# allowed_tools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch"].
+allowed_tools = ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebSearch", "WebFetch"]
 timeout_minutes = 15
 
 [[task]]
