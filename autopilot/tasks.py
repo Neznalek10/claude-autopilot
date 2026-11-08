@@ -80,6 +80,25 @@ PROTECTED_READ_RULES = (
 )
 
 DEFAULT_ALLOWED_TOOLS = ("Read", "Glob", "Grep", "WebSearch", "WebFetch")
+DEFAULT_ASK_ALLOWED_TOOLS = (
+    "Read",
+    "Glob",
+    "Grep",
+    "WebSearch",
+    "WebFetch",
+    "Edit(./**)",
+    "Write(./**)",
+    "Bash(ls *)",
+    "Bash(pwd)",
+    "Bash(date *)",
+    "Bash(wc *)",
+    "Bash(mkdir *)",
+    "Bash(git status *)",
+    "Bash(git log *)",
+    "Bash(git diff *)",
+    "Bash(git show *)",
+    "Bash(git branch *)",
+)
 DEFAULT_TIMEOUT_MINUTES = 30
 DEFAULT_ASK_TIMEOUT_MINUTES = 15
 MAX_TIMEOUT_MINUTES = 720
@@ -258,6 +277,7 @@ def _build_options(
     base_dir: Path,
     default_timeout_minutes: int,
     protected_rules: tuple[str, ...],
+    default_allowed_tools: tuple[str, ...] = DEFAULT_ALLOWED_TOOLS,
 ) -> RunOptions:
     """Validate the option keys in ``raw`` (already merged) and build RunOptions.
 
@@ -268,6 +288,7 @@ def _build_options(
             is the default workdir.
         default_timeout_minutes: Timeout used when ``timeout_minutes`` is absent.
         protected_rules: Deny rules appended (deduplicated) to ``disallowed_tools``.
+        default_allowed_tools: Tools allowed when ``allowed_tools`` is absent.
 
     Raises:
         ConfigError: On the first invalid value.
@@ -289,7 +310,7 @@ def _build_options(
         model=_optional(raw, "model", lambda v: _parse_text(v, label, "model", MODEL_RE, MODEL_HINT)),
         effort=_optional(raw, "effort", lambda v: _parse_choice(v, label, "effort", EFFORT_LEVELS)),
         allowed_tools=_optional(
-            raw, "allowed_tools", lambda v: _parse_tool_list(v, label, "allowed_tools"), DEFAULT_ALLOWED_TOOLS
+            raw, "allowed_tools", lambda v: _parse_tool_list(v, label, "allowed_tools"), default_allowed_tools
         ),
         disallowed_tools=tuple(dict.fromkeys(disallowed + protected_rules)),
         permission_mode=_optional(
@@ -427,7 +448,12 @@ def _build_ask_options(
     """
     _check_keys(ask, ASK_KEYS, ASK_LABEL)
     return _build_options(
-        {**default_options, **ask}, ASK_LABEL, base_dir, DEFAULT_ASK_TIMEOUT_MINUTES, protected_rules
+        {**default_options, **ask},
+        ASK_LABEL,
+        base_dir,
+        DEFAULT_ASK_TIMEOUT_MINUTES,
+        protected_rules,
+        DEFAULT_ASK_ALLOWED_TOOLS,
     )
 
 

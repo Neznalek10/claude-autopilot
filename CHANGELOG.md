@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Chat now defaults to editing and writing files inside its workspace folder and a short list of safe shell commands (`ls`, `pwd`, `date`, `wc`, `mkdir`, `git status/log/diff/show/branch`). Set `allowed_tools` under `[ask]` to change it. Credential files stay blocked.
+
 ## [1.2.0] - 2026-11-07
 
 ### Added
